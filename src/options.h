@@ -27,6 +27,11 @@
 // delete julia IR for non-inlineable functions after they're codegen'd
 #define JL_DELETE_NON_INLINEABLE 1
 
+// fill in the jl_all_methods in world-counter order
+// so that it is possible to map (in a debugger) from
+// an inferred world validity range back to the offending definition
+// #define RECORD_METHOD_ORDER
+
 // GC options -----------------------------------------------------------------
 
 // debugging options
@@ -35,6 +40,11 @@
 // filled with 0xbb before being freed. this helps tools like valgrind
 // catch invalid accesses.
 // #define MEMDEBUG
+
+// with MEMFENCE, the object pool headers are verified during sweep
+// to help detect corruption due to fence-post write errors
+// #define MEMFENCE
+
 
 // GC_VERIFY force a full verification gc along with every quick gc to ensure no
 // reachable memory is freed
@@ -67,6 +77,9 @@
 // OBJPROFILE counts objects by type
 // #define OBJPROFILE
 
+// Automatic Instrumenting Profiler
+//#define ENABLE_TIMINGS
+
 
 // method dispatch profiling --------------------------------------------------
 
@@ -76,6 +89,7 @@
 
 // print all signatures type inference is invoked on
 //#define TRACE_INFERENCE
+//#define TRACE_COMPILE
 
 // print all generic method dispatches (excludes inlined and specialized call
 // sites). this generally prints too much output to be useful.
@@ -93,6 +107,7 @@
 #define COPY_STACKS
 #endif
 
+
 // threading options ----------------------------------------------------------
 
 // controls for when threads sleep
@@ -109,21 +124,32 @@
 #define MACHINE_EXCLUSIVE_NAME          "JULIA_EXCLUSIVE"
 #define DEFAULT_MACHINE_EXCLUSIVE       0
 
+
 // sanitizer defaults ---------------------------------------------------------
 
-// Automatically enable MEMDEBUG and KEEP_BODIES for the sanitizers
+// XXX: these macros are duplicated from julia_internal.h
 #if defined(__has_feature)
-#  if __has_feature(address_sanitizer) || __has_feature(memory_sanitizer)
-#  define MEMDEBUG
-#  define KEEP_BODIES
-#  endif
-// Memory sanitizer needs TLS, which llvm only supports for the small memory model
-#  if __has_feature(memory_sanitizer)
-   // todo: fix the llvm MemoryManager to work with small memory model
-#  endif
+#if __has_feature(address_sanitizer)
+#define JL_ASAN_ENABLED
+#endif
+#elif defined(__SANITIZE_ADDRESS__)
+#define JL_ASAN_ENABLED
+#endif
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+#define JL_MSAN_ENABLED
+#endif
 #endif
 
-// Automatic Instrumenting Profiler
-//#define ENABLE_TIMINGS
+// Automatically enable MEMDEBUG and KEEP_BODIES for the sanitizers
+#if defined(JL_ASAN_ENABLED) || defined(JL_MSAN_ENABLED)
+#define MEMDEBUG
+#define KEEP_BODIES
+#endif
+
+// Memory sanitizer needs TLS, which llvm only supports for the small memory model
+#if defined(JL_MSAN_ENABLED)
+// todo: fix the llvm MemoryManager to work with small memory model
+#endif
 
 #endif

@@ -30,7 +30,9 @@
 extern "C" {
 #endif
 
-// manipulating mark bits
+#define GC_PAGE_LG2 14 // log2(size of a page)
+#define GC_PAGE_SZ (1 << GC_PAGE_LG2) // 16k
+#define GC_PAGE_OFFSET (JL_SMALL_BYTE_ALIGNMENT - (sizeof(jl_taggedvalue_t) % JL_SMALL_BYTE_ALIGNMENT))
 
 // 8G * 32768 = 2^48
 // It's really unlikely that we'll actually allocate that much though...
@@ -111,27 +113,25 @@ typedef struct _mallocarray_t {
 
 // pool page metadata
 typedef struct {
-    struct {
-        // index of pool that owns this page
-        uint16_t pool_n : 8;
-        // Whether any cell in the page is marked
-        // This bit is set before sweeping iff there's live cells in the page.
-        // Note that before marking or after sweeping there can be live
-        // (and young) cells in the page for `!has_marked`.
-        uint16_t has_marked: 1;
-        // Whether any cell was live and young **before sweeping**.
-        // For a normal sweep (quick sweep that is NOT preceded by a
-        // full sweep) this bit is set iff there are young or newly dead
-        // objects in the page and the page needs to be swept.
-        //
-        // For a full sweep, this bit should be ignored.
-        //
-        // For a quick sweep preceded by a full sweep. If this bit is set,
-        // the page needs to be swept. If this bit is not set, there could
-        // still be old dead objects in the page and `nold` and `prev_nold`
-        // should be used to determine if the page needs to be swept.
-        uint16_t has_young: 1;
-    };
+    // index of pool that owns this page
+    uint8_t pool_n;
+    // Whether any cell in the page is marked
+    // This bit is set before sweeping iff there are live cells in the page.
+    // Note that before marking or after sweeping there can be live
+    // (and young) cells in the page for `!has_marked`.
+    uint8_t has_marked;
+    // Whether any cell was live and young **before sweeping**.
+    // For a normal sweep (quick sweep that is NOT preceded by a
+    // full sweep) this bit is set iff there are young or newly dead
+    // objects in the page and the page needs to be swept.
+    //
+    // For a full sweep, this bit should be ignored.
+    //
+    // For a quick sweep preceded by a full sweep. If this bit is set,
+    // the page needs to be swept. If this bit is not set, there could
+    // still be old dead objects in the page and `nold` and `prev_nold`
+    // should be used to determine if the page needs to be swept.
+    uint8_t has_young;
     // number of old objects in this page
     uint16_t nold;
     // number of old objects in this page during the previous full sweep
@@ -157,7 +157,8 @@ __attribute__((aligned(GC_PAGE_SZ)))
 
 typedef struct {
     // Page layout:
-    //  Padding: GC_PAGE_OFFSET
+    //  Newpage freelist: sizeof(void*)
+    //  Padding: GC_PAGE_OFFSET - sizeof(void*)
     //  Blocks: osize * n
     //    Tag: sizeof(jl_taggedvalue_t)
     //    Data: <= osize - sizeof(jl_taggedvalue_t)
@@ -204,14 +205,19 @@ STATIC_INLINE int page_index(region_t *region, void *data)
     return (gc_page_data(data) - region->pages->data) / GC_PAGE_SZ;
 }
 
-STATIC_INLINE int gc_marked(int bits)
+STATIC_INLINE int gc_marked(uintptr_t bits)
 {
     return (bits & GC_MARKED) != 0;
 }
 
-STATIC_INLINE int gc_old(int bits)
+STATIC_INLINE int gc_old(uintptr_t bits)
 {
     return (bits & GC_OLD) != 0;
+}
+
+STATIC_INLINE uintptr_t gc_set_bits(uintptr_t tag, int bits)
+{
+    return (tag & ~(uintptr_t)3) | bits;
 }
 
 STATIC_INLINE uintptr_t gc_ptr_tag(void *v, uintptr_t mask)
@@ -228,7 +234,6 @@ NOINLINE uintptr_t gc_get_stack_ptr(void);
 
 STATIC_INLINE region_t *find_region(void *ptr)
 {
-    // on 64bit systems we could probably use a single region and remove this loop
     for (int i = 0; i < REGION_COUNT && regions[i].pages; i++) {
         region_t *region = &regions[i];
         char *begin = region->pages->data;
@@ -240,16 +245,18 @@ STATIC_INLINE region_t *find_region(void *ptr)
     return NULL;
 }
 
-STATIC_INLINE jl_gc_pagemeta_t *page_metadata_(void *data, region_t *r)
+STATIC_INLINE jl_gc_pagemeta_t *page_metadata(void *_data)
 {
-    assert(r != NULL);
-    int pg_idx = page_index(r, (char*)data - GC_PAGE_OFFSET);
-    return &r->meta[pg_idx];
-}
-
-STATIC_INLINE jl_gc_pagemeta_t *page_metadata(void *data)
-{
-    return page_metadata_(data, find_region(data));
+    uintptr_t data = ((uintptr_t)_data) - 1;
+    for (int i = 0; i < REGION_COUNT && regions[i].pages; i++) {
+        region_t *region = &regions[i];
+        uintptr_t begin = (uintptr_t)region->pages->data;
+        uintptr_t offset = data - begin;
+        if (offset < region->pg_cnt * sizeof(jl_gc_page_t)) {
+            return &region->meta[offset >> GC_PAGE_LG2];
+        }
+    }
+    return NULL;
 }
 
 STATIC_INLINE void gc_big_object_unlink(const bigval_t *hdr)
@@ -269,7 +276,7 @@ STATIC_INLINE void gc_big_object_link(bigval_t *hdr, bigval_t **list)
     *list = hdr;
 }
 
-void pre_mark(jl_ptls_t ptls);
+void mark_all_roots(jl_ptls_t ptls);
 void gc_mark_object_list(jl_ptls_t ptls, arraylist_t *list, size_t start);
 void visit_mark_stack(jl_ptls_t ptls);
 void gc_debug_init(void);
@@ -343,6 +350,15 @@ STATIC_INLINE void gc_time_count_mallocd_array(int bits)
                             estimate_freed, sweep_full)
 #endif
 
+#ifdef MEMFENCE
+void gc_verify_tags(void);
+#else
+static inline void gc_verify_tags(void)
+{
+}
+#endif
+
+
 #ifdef GC_VERIFY
 extern jl_value_t *lostval;
 void gc_verify(jl_ptls_t ptls);
@@ -389,7 +405,8 @@ JL_DLLEXPORT extern jl_gc_debug_env_t jl_gc_debug_env;
 int gc_debug_check_other(void);
 int gc_debug_check_pool(void);
 void gc_debug_print(void);
-void gc_scrub(char *stack_hi);
+void gc_scrub_record_task(jl_task_t *ta);
+void gc_scrub(void);
 #else
 #define gc_sweep_always_full 0
 static inline int gc_debug_check_other(void)
@@ -403,9 +420,12 @@ static inline int gc_debug_check_pool(void)
 static inline void gc_debug_print(void)
 {
 }
-static inline void gc_scrub(char *stack_hi)
+static inline void gc_scrub_record_task(jl_task_t *ta)
 {
-    (void)stack_hi;
+    (void)ta;
+}
+static inline void gc_scrub(void)
+{
 }
 #endif
 
@@ -428,8 +448,8 @@ static inline void objprofile_reset(void)
 #endif
 
 #ifdef MEMPROFILE
-static void gc_stats_all_pool(void);
-static void gc_stats_big_obj(void);
+void gc_stats_all_pool(void);
+void gc_stats_big_obj(void);
 #else
 #define gc_stats_all_pool()
 #define gc_stats_big_obj()

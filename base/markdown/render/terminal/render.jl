@@ -24,7 +24,7 @@ function term(io::IO, md::Paragraph, columns)
 end
 
 function term(io::IO, md::BlockQuote, columns)
-    s = sprint(io->term(io, md.content, columns - 10))
+    s = sprint(term, md.content, columns - 10)
     for line in split(rstrip(s), "\n")
         println(io, " "^margin, "|", line)
     end
@@ -34,7 +34,17 @@ function term(io::IO, md::Admonition, columns)
     print(io, " "^margin, "| ")
     with_output_format(:bold, print, io, isempty(md.title) ? md.category : md.title)
     println(io, "\n", " "^margin, "|")
-    s = sprint(io -> term(io, md.content, columns - 10))
+    s = sprint(term, md.content, columns - 10)
+    for line in split(rstrip(s), "\n")
+        println(io, " "^margin, "|", line)
+    end
+end
+
+function term(io::IO, f::Footnote, columns)
+    print(io, " "^margin, "| ")
+    with_output_format(:bold, print, io, "[^$(f.id)]")
+    println(io, "\n", " "^margin, "|")
+    s = sprint(term, f.text, columns - 10)
     for line in split(rstrip(s), "\n")
         println(io, " "^margin, "|", line)
     end
@@ -121,13 +131,10 @@ function terminline(io::IO, md::Image)
     terminline(io, "(Image: $(md.alt))")
 end
 
+terminline(io::IO, f::Footnote) = with_output_format(:bold, terminline, io, "[^$(f.id)]")
+
 function terminline(io::IO, md::Link)
     terminline(io, md.text)
-end
-
-function terminline(io::IO, md::Footnote)
-    print(io, "[^", md.id, "]")
-    md.text ≡ nothing || (print(io, ":"); terminline(io, md.text))
 end
 
 function terminline(io::IO, code::Code)

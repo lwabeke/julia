@@ -39,7 +39,7 @@ function show{K,V}(io::IO, ::MIME"text/plain", t::Associative{K,V})
     recur_io = IOContext(io, :SHOWN_SET => t)
     limit::Bool = get(io, :limit, false)
     if !haskey(io, :compact)
-        recur_io = IOContext(recur_io, compact=true)
+        recur_io = IOContext(recur_io, :compact => true)
     end
 
     print(io, summary(t))
@@ -99,13 +99,17 @@ end
 function show(io::IO, ::MIME"text/plain", f::Function)
     ft = typeof(f)
     mt = ft.name.mt
-    if isa(f, Core.Builtin)
+    if isa(f, Core.IntrinsicFunction)
+        show(io, f)
+        id = Core.Intrinsics.bitcast(Int32, f)
+        print(io, " (intrinsic function #$id)")
+    elseif isa(f, Core.Builtin)
         print(io, mt.name, " (built-in function)")
     else
         name = mt.name
         isself = isdefined(ft.name.module, name) &&
                  ft == typeof(getfield(ft.name.module, name))
-        n = length(mt)
+        n = length(methods(f))
         m = n==1 ? "method" : "methods"
         ns = isself ? string(name) : string("(::", name, ")")
         what = startswith(ns, '@') ? "macro" : "generic function"
@@ -136,6 +140,16 @@ end
 show(io::IO, ::MIME"text/plain", X::AbstractArray) = showarray(io, X, false)
 show(io::IO, ::MIME"text/plain", r::Range) = show(io, r) # always use the compact form for printing ranges
 
+# display something useful even for strings containing arbitrary
+# (non-UTF8) binary data:
+function show(io::IO, ::MIME"text/plain", s::String)
+    if isvalid(s)
+        show(io, s)
+    else
+        println(io, sizeof(s), "-byte String of invalid UTF-8 data:")
+        showarray(io, Vector{UInt8}(s), false; header=false)
+    end
+end
 
 # showing exception objects as descriptive error messages
 
@@ -156,7 +170,7 @@ function showerror(io::IO, ex::BoundsError)
             if isa(ex.i, Range)
                 print(io, ex.i)
             else
-                join(io, ex.i, ',')
+                join(io, ex.i, ", ")
             end
             print(io, ']')
         end
@@ -180,7 +194,9 @@ end
 
 function showerror(io::IO, ex, bt; backtrace=true)
     try
-        showerror(io, ex)
+        with_output_color(have_color ? error_color() : :nothing, io) do io
+            showerror(io, ex)
+        end
     finally
         backtrace && show_backtrace(io, bt)
     end
@@ -203,28 +219,35 @@ showerror(io::IO, ex::InitError) = showerror(io, ex, [])
 function showerror(io::IO, ex::DomainError, bt; backtrace=true)
     print(io, "DomainError:")
     for b in bt
-        code = StackTraces.lookup(b)[1]
-        if !code.from_c
-            if code.func == :nan_dom_err
+        for code in StackTraces.lookup(b)
+            if code.from_c
                 continue
-            elseif code.func in (:log, :log2, :log10, :sqrt) # TODO add :besselj, :besseli, :bessely, :besselk
-                print(io,"\n$(code.func) will only return a complex result if called with a complex argument. Try $(string(code.func))(complex(x)).")
-            elseif (code.func == :^ && code.file == Symbol("intfuncs.jl")) || code.func == :power_by_squaring #3024
-                print(io, "\nCannot raise an integer x to a negative power -n. \nMake x a float by adding a zero decimal (e.g. 2.0^-n instead of 2^-n), or write 1/x^n, float(x)^-n, or (x//1)^-n.")
-            elseif code.func == :^ &&
-                    (code.file == Symbol("promotion.jl") || code.file == Symbol("math.jl") ||
-                    code.file == Symbol(joinpath(".","promotion.jl")) || code.file == Symbol(joinpath(".","math.jl")))
-                print(io, "\nExponentiation yielding a complex result requires a complex argument.\nReplace x^y with (x+0im)^y, Complex(x)^y, or similar.")
+            elseif code.func === :nan_dom_err
+                continue
+            elseif code.func in (:log, :log2, :log10, :sqrt)
+                print(io, "\n$(code.func) will only return a complex result if called ",
+                    "with a complex argument. Try $(string(code.func))(complex(x)).")
+            elseif (code.func === :^ &&
+                    (code.file === Symbol("intfuncs.jl") || code.file === Symbol(joinpath(".", "intfuncs.jl")))) ||
+                   code.func === :power_by_squaring #3024
+                print(io, "\nCannot raise an integer x to a negative power -n. ",
+                    "\nMake x a float by adding a zero decimal (e.g. 2.0^-n instead ",
+                    "of 2^-n), or write 1/x^n, float(x)^-n, or (x//1)^-n.")
+            elseif code.func === :^ &&
+                    (code.file === Symbol("math.jl") || code.file === Symbol(joinpath(".", "math.jl")))
+                print(io, "\nExponentiation yielding a complex result requires a complex ",
+                    "argument.\nReplace x^y with (x+0im)^y, Complex(x)^y, or similar.")
             end
-            break
+            @goto showbacktrace
         end
     end
+    @label showbacktrace
     backtrace && show_backtrace(io, bt)
     nothing
 end
 
 function showerror(io::IO, ex::SystemError)
-    if ex.extrainfo == nothing
+    if ex.extrainfo === nothing
         print(io, "SystemError: $(ex.prefix): $(Libc.strerror(ex.errnum))")
     else
         print(io, "SystemError (with $(ex.extrainfo)): $(ex.prefix): $(Libc.strerror(ex.errnum))")
@@ -234,14 +257,20 @@ showerror(io::IO, ::DivideError) = print(io, "DivideError: integer division erro
 showerror(io::IO, ::StackOverflowError) = print(io, "StackOverflowError:")
 showerror(io::IO, ::UndefRefError) = print(io, "UndefRefError: access to undefined reference")
 showerror(io::IO, ::EOFError) = print(io, "EOFError: read end of file")
-showerror(io::IO, ex::ErrorException) = print(io, ex.msg)
+function showerror(io::IO, ex::ErrorException)
+    print(io, ex.msg)
+    if ex.msg == "type String has no field data"
+        println(io)
+        print(io, "Use `Vector{UInt8}(str)` instead.")
+    end
+end
 showerror(io::IO, ex::KeyError) = print(io, "KeyError: key $(repr(ex.key)) not found")
 showerror(io::IO, ex::InterruptException) = print(io, "InterruptException:")
 showerror(io::IO, ex::ArgumentError) = print(io, "ArgumentError: $(ex.msg)")
 showerror(io::IO, ex::AssertionError) = print(io, "AssertionError: $(ex.msg)")
 
 function showerror(io::IO, ex::UndefVarError)
-    if ex.var in [:UTF16String, :UTF32String, :WString, :utf16, :utf32, :wstring]
+    if ex.var in [:UTF16String, :UTF32String, :WString, :utf16, :utf32, :wstring, :RepString]
         return showerror(io, ErrorException("""
         `$(ex.var)` has been moved to the package LegacyStrings.jl:
         Run Pkg.add("LegacyStrings") to install LegacyStrings on Julia v0.5-;
@@ -267,7 +296,7 @@ function showerror(io::IO, ex::MethodError)
     name = ft.name.mt.name
     f_is_function = false
     kwargs = Any[]
-    if startswith(string(ft.name), "#kw#")
+    if startswith(string(ft.name.name), "#kw#")
         f = ex.args[2]
         ft = typeof(f)
         name = ft.name.mt.name
@@ -280,7 +309,7 @@ function showerror(io::IO, ex::MethodError)
         f_is_function = true
         # See #13033
         T = striptype(ex.args[1])
-        if T == nothing
+        if T === nothing
             print(io, "First argument to `convert` must be a Type, got ", ex.args[1])
         else
             print(io, "Cannot `convert` an object of type ", arg_types_param[2], " to an object of type ", T)
@@ -294,6 +323,18 @@ function showerror(io::IO, ex::MethodError)
             f_is_function = true
             print(io, "no method matching ", name)
         elseif isa(f, Type)
+            if isa(f, DataType) && f.abstract
+                # Print a more appropriate message if the only method
+                # on the type is the default one from sysimg.jl.
+                ms = methods(f)
+                if length(ms) == 1
+                    m = first(ms)
+                    if Base.is_default_method(m)
+                        print(io, "no constructors have been defined for $f")
+                        return
+                    end
+                end
+            end
             print(io, "no method matching ", f)
         else
             print(io, "no method matching (::", ft, ")")
@@ -321,8 +362,14 @@ function showerror(io::IO, ex::MethodError)
         basef = getfield(Base, name)
         if basef !== ex.f && method_exists(basef, arg_types)
             println(io)
-            print(io, "you may have intended to import Base.", name)
+            print(io, "You may have intended to import Base.", name)
         end
+    end
+    if (ex.world != typemax(UInt) && method_exists(ex.f, arg_types) &&
+        !method_exists(ex.f, arg_types, ex.world))
+        curworld = ccall(:jl_get_world_counter, UInt, ())
+        println(io)
+        print(io, "The applicable method may be too new: running in world age $(ex.world), while current world is $(curworld).")
     end
     if !is_arg_types
         # Check for row vectors used where a column vector is intended.
@@ -343,7 +390,7 @@ function showerror(io::IO, ex::MethodError)
     # and sees a no method error for convert
     if (f === Base.convert && !isempty(arg_types_param) && !is_arg_types &&
         isa(arg_types_param[1], DataType) &&
-        arg_types_param[1].name === Type.name)
+        arg_types_param[1].name === Type.body.name)
         construct_type = arg_types_param[1].parameters[1]
         println(io)
         print(io, "This may have arisen from a call to the constructor $construct_type(...),",
@@ -389,11 +436,7 @@ function show_method_candidates(io::IO, ex::MethodError, kwargs::Vector=Any[])
     arg_types_param = Any[arg_types.parameters...]
     # Displays the closest candidates of the given function by looping over the
     # functions methods and counting the number of matching arguments.
-    if isa(ex.f, Tuple)
-        f = ex.f[1]
-    else
-        f = ex.f
-    end
+    f = ex.f
     ft = typeof(f)
     lines = []
     # These functions are special cased to only show if first argument is matched.
@@ -405,7 +448,7 @@ function show_method_candidates(io::IO, ex::MethodError, kwargs::Vector=Any[])
     # pool MethodErrors for these two functions.
     if f === convert && !isempty(arg_types_param)
         at1 = arg_types_param[1]
-        if isa(at1,DataType) && (at1::DataType).name === Type.name && isleaftype(at1)
+        if isa(at1,DataType) && (at1::DataType).name === Type.body.name && isleaftype(at1)
             push!(funcs, (at1.parameters[1], arg_types_param[2:end]))
         end
     end
@@ -413,22 +456,25 @@ function show_method_candidates(io::IO, ex::MethodError, kwargs::Vector=Any[])
     for (func,arg_types_param) in funcs
         for method in methods(func)
             buf = IOBuffer()
-            s1 = method.sig.parameters[1]
-            sig = method.sig.parameters[2:end]
+            tv = Any[]
+            sig0 = method.sig
+            if Base.is_default_method(method)
+                continue
+            end
+            while isa(sig0, UnionAll)
+                push!(tv, sig0.var)
+                sig0 = sig0.body
+            end
+            s1 = sig0.parameters[1]
+            sig = sig0.parameters[2:end]
             print(buf, "  ")
             if !isa(func, s1)
                 # function itself doesn't match
                 return
             else
+                # TODO: use the methodshow logic here
                 use_constructor_syntax = isa(func, Type)
                 print(buf, use_constructor_syntax ? func : typeof(func).name.mt.name)
-            end
-            tv = method.tvars
-            if !isa(tv,SimpleVector)
-                tv = Any[tv]
-            end
-            if !isempty(tv)
-                show_delim_array(buf, tv, '{', ',', '}', false)
             end
             print(buf, "(")
             t_i = copy(arg_types_param)
@@ -438,20 +484,21 @@ function show_method_candidates(io::IO, ex::MethodError, kwargs::Vector=Any[])
                 # If isvarargtype then it checks whether the rest of the input arguments matches
                 # the varargtype
                 if Base.isvarargtype(sig[i])
-                    sigstr = string(sig[i].parameters[1], "...")
+                    sigstr = string(unwrap_unionall(sig[i]).parameters[1], "...")
                     j = length(t_i)
                 else
                     sigstr = string(sig[i])
                     j = i
                 end
                 # Checks if the type of arg 1:i of the input intersects with the current method
-                t_in = typeintersect(Tuple{sig[1:i]...}, Tuple{t_i[1:j]...})
+                t_in = typeintersect(rewrap_unionall(Tuple{sig[1:i]...}, method.sig),
+                                     rewrap_unionall(Tuple{t_i[1:j]...}, method.sig))
                 # If the function is one of the special cased then it should break the loop if
                 # the type of the first argument is not matched.
                 t_in === Union{} && special && i == 1 && break
                 if t_in === Union{}
                     if Base.have_color
-                        Base.with_output_color(:red, buf) do buf
+                        Base.with_output_color(Base.error_color(), buf) do buf
                             print(buf, "::$sigstr")
                         end
                     else
@@ -472,7 +519,7 @@ function show_method_candidates(io::IO, ex::MethodError, kwargs::Vector=Any[])
                 # It ensures that methods like f(a::AbstractString...) gets the correct
                 # number of right_matches
                 for t in arg_types_param[length(sig):end]
-                    if t <: sig[end].parameters[1]
+                    if t <: rewrap_unionall(unwrap_unionall(sig[end]).parameters[1], method.sig)
                         right_matches += 1
                     end
                 end
@@ -483,6 +530,7 @@ function show_method_candidates(io::IO, ex::MethodError, kwargs::Vector=Any[])
                     # If the methods args is longer than input then the method
                     # arguments is printed as not a match
                     for (k, sigtype) in enumerate(sig[length(t_i)+1:end])
+                        sigtype = isvarargtype(sigtype) ? unwrap_unionall(sigtype) : sigtype
                         if Base.isvarargtype(sigtype)
                             sigstr = string(sigtype.parameters[1], "...")
                         else
@@ -492,7 +540,7 @@ function show_method_candidates(io::IO, ex::MethodError, kwargs::Vector=Any[])
                             print(buf, ", ")
                         end
                         if Base.have_color
-                            Base.with_output_color(:red, buf) do buf
+                            Base.with_output_color(Base.error_color(), buf) do buf
                                 print(buf, "::$sigstr")
                             end
                         else
@@ -503,10 +551,12 @@ function show_method_candidates(io::IO, ex::MethodError, kwargs::Vector=Any[])
                 kwords = Symbol[]
                 if isdefined(ft.name.mt, :kwsorter)
                     kwsorter_t = typeof(ft.name.mt.kwsorter)
-                    kwords = kwarg_decl(method.sig, kwsorter_t)
+                    kwords = kwarg_decl(method, kwsorter_t)
                     length(kwords) > 0 && print(buf, "; ", join(kwords, ", "))
                 end
                 print(buf, ")")
+                show_method_params(buf, tv)
+                print(buf, " at ", method.file, ":", method.line)
                 if !isempty(kwargs)
                     unexpected = Symbol[]
                     if isempty(kwords) || !(any(endswith(string(kword), "...") for kword in kwords))
@@ -517,11 +567,19 @@ function show_method_candidates(io::IO, ex::MethodError, kwargs::Vector=Any[])
                         end
                     end
                     if !isempty(unexpected)
-                        Base.with_output_color(:red, buf) do buf
-                            print(buf, " got an unsupported keyword argument \"", join(unexpected, "\", \""), "\"")
+                        Base.with_output_color(Base.error_color(), buf) do buf
+                            plur = length(unexpected) > 1 ? "s" : ""
+                            print(buf, " got unsupported keyword argument$plur \"", join(unexpected, "\", \""), "\"")
                         end
                     end
                 end
+                if ex.world < min_world(method)
+                    print(buf, " (method too new to be called from this world context.)")
+                end
+                if ex.world > max_world(method)
+                    print(buf, " (method deleted before this world age.)")
+                end
+                # TODO: indicate if it's in the wrong world
                 push!(lines, (buf, right_matches))
             end
         end
@@ -540,44 +598,45 @@ function show_method_candidates(io::IO, ex::MethodError, kwargs::Vector=Any[])
                     break
                 end
                 i += 1
-                print(io, takebuf_string(line[1]))
+                print(io, String(take!(line[1])))
             end
         end
     end
 end
 
-function show_trace_entry(io, frame, n)
-    print(io, "\n")
+function show_trace_entry(io, frame, n; prefix = "")
+    print(io, "\n", prefix)
     show(io, frame, full_path=true)
     n > 1 && print(io, " (repeats ", n, " times)")
 end
 
-function show_backtrace(io::IO, t::Vector, set=1:typemax(Int))
-    # we may not declare :eval_user_input
-    # directly so that we get a compile error
-    # in case its name changes in the future
-    show_backtrace(io,
-                    try
-                        typeof(eval_user_input).name.mt.name
-                    catch
-                        :(:) #for when client.jl is not yet defined
-                    end, t, set)
+# Contains file name and file number. Gets set when a backtrace
+# is shown. Used by the REPL to make it possible to open
+# the location of a stackframe in the edítor.
+global LAST_BACKTRACE_LINE_INFOS = Tuple{String, Int}[]
+
+function show_backtrace(io::IO, t::Vector)
+    n_frames = 0
+    frame_counter = 0
+    resize!(LAST_BACKTRACE_LINE_INFOS, 0)
+    process_backtrace((a,b) -> n_frames += 1, t)
+    n_frames != 0 && print(io, "\nStacktrace:")
+    process_entry = (last_frame, n) -> begin
+        frame_counter += 1
+        show_trace_entry(IOContext(io, :backtrace => true), last_frame, n, prefix = string(" [", frame_counter, "] "))
+        push!(LAST_BACKTRACE_LINE_INFOS, (string(last_frame.file), last_frame.line))
+    end
+    process_backtrace(process_entry, t)
 end
 
-function show_backtrace(io::IO, top_function::Symbol, t::Vector, set)
-    process_entry(last_frame, n) =
-        show_trace_entry(io, last_frame, n)
-    process_backtrace(process_entry, top_function, t, set)
-end
-
-function show_backtrace(io::IO, top_function::Symbol, t::Vector{Any}, set)
+function show_backtrace(io::IO, t::Vector{Any})
     for entry in t
         show_trace_entry(io, entry...)
     end
 end
 
-# process the backtrace, up to (but not including) top_function
-function process_backtrace(process_func::Function, top_function::Symbol, t::Vector, set; skipC = true)
+# call process_func on each frame in a backtrace
+function process_backtrace(process_func::Function, t::Vector, limit::Int=typemax(Int); skipC = true)
     n = 0
     last_frame = StackTraces.UNKNOWN
     count = 0
@@ -590,9 +649,8 @@ function process_backtrace(process_func::Function, top_function::Symbol, t::Vect
 
             if lkup.from_c && skipC; continue; end
             if i == 1 && lkup.func == :error; continue; end
-            if lkup.func == top_function; break; end
             count += 1
-            if !in(count, set); continue; end
+            if count > limit; break; end
 
             if lkup.file != last_frame.file || lkup.line != last_frame.line || lkup.func != last_frame.func
                 if n > 0
@@ -608,4 +666,12 @@ function process_backtrace(process_func::Function, top_function::Symbol, t::Vect
     if n > 0
         process_func(last_frame, n)
     end
+end
+
+"""
+Determines whether a method is the default method which is provided to all types from sysimg.jl.
+Such a method is usually undesirable to be displayed to the user in the REPL.
+"""
+function is_default_method(m::Method)
+    return m.module == Base && m.file == Symbol("sysimg.jl") && m.sig == Tuple{Type{T},Any} where T
 end

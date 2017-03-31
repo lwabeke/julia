@@ -15,7 +15,8 @@ extern "C" {
 #endif
 
 typedef struct {
-    jl_lambda_info_t *lam;
+    jl_code_info_t *src;
+    jl_module_t *module;
     jl_value_t **locals;
     jl_svec_t *sparam_vals;
 } interpreter_state;
@@ -28,18 +29,26 @@ int jl_is_toplevel_only_expr(jl_value_t *e);
 
 jl_value_t *jl_interpret_toplevel_expr(jl_value_t *e)
 {
-    return eval(e, NULL);
+    size_t last_age = jl_get_ptls_states()->world_age;
+    jl_get_ptls_states()->world_age = jl_world_counter;
+    jl_value_t *ret = eval(e, NULL);
+    jl_get_ptls_states()->world_age = last_age;
+    return ret;
 }
 
-JL_DLLEXPORT jl_value_t *jl_interpret_toplevel_expr_in(jl_module_t *m, jl_value_t *e,
-                                                       jl_lambda_info_t *lam)
+jl_value_t *jl_interpret_toplevel_expr_in(jl_module_t *m, jl_value_t *e,
+                                          jl_code_info_t *src,
+                                          jl_svec_t *sparam_vals)
 {
     jl_ptls_t ptls = jl_get_ptls_states();
     jl_value_t *v=NULL;
     jl_module_t *last_m = ptls->current_module;
     jl_module_t *task_last_m = ptls->current_task->current_module;
     interpreter_state s;
-    s.lam = lam; s.locals = NULL; s.sparam_vals = NULL;
+    s.src = src;
+    s.module = m;
+    s.locals = NULL;
+    s.sparam_vals = sparam_vals;
 
     JL_TRY {
         ptls->current_task->current_module = ptls->current_module = m;
@@ -75,8 +84,8 @@ static jl_value_t *do_invoke(jl_value_t **args, size_t nargs, interpreter_state 
     size_t i;
     for (i = 1; i < nargs; i++)
         argv[i - 1] = eval(args[i], s);
-    jl_lambda_info_t *meth = (jl_lambda_info_t*)args[0];
-    assert(jl_is_lambda_info(meth) && !meth->inInference);
+    jl_method_instance_t *meth = (jl_method_instance_t*)args[0];
+    assert(jl_is_method_instance(meth) && !meth->inInference);
     jl_value_t *result = jl_call_method_internal(meth, argv, nargs - 1);
     JL_GC_POP();
     return result;
@@ -96,23 +105,66 @@ extern int inside_typedef;
 // this is a heuristic for allowing "redefining" a type to something identical
 static int equiv_type(jl_datatype_t *dta, jl_datatype_t *dtb)
 {
-    return (jl_typeof(dta) == jl_typeof(dtb) &&
-            // TODO: can't yet handle parametric types due to how constructors work
-            dta->parameters == jl_emptysvec &&
-            dta->name->name == dtb->name->name &&
-            jl_egal((jl_value_t*)dta->types, (jl_value_t*)dtb->types) &&
-            dta->abstract == dtb->abstract &&
-            dta->mutabl == dtb->mutabl &&
-            dta->size == dtb->size &&
-            dta->ninitialized == dtb->ninitialized &&
-            jl_egal((jl_value_t*)dta->super, (jl_value_t*)dtb->super) &&
-            jl_egal((jl_value_t*)dta->name->names, (jl_value_t*)dtb->name->names) &&
-            jl_egal((jl_value_t*)dta->parameters, (jl_value_t*)dtb->parameters));
+    if (!(jl_typeof(dta) == jl_typeof(dtb) &&
+          dta->name->name == dtb->name->name &&
+          dta->abstract == dtb->abstract &&
+          dta->mutabl == dtb->mutabl &&
+          dta->size == dtb->size &&
+          dta->ninitialized == dtb->ninitialized &&
+          jl_egal((jl_value_t*)dta->name->names, (jl_value_t*)dtb->name->names) &&
+          jl_nparams(dta) == jl_nparams(dtb) &&
+          jl_field_count(dta) == jl_field_count(dtb)))
+        return 0;
+    jl_value_t *a=NULL, *b=NULL;
+    int ok = 1;
+    size_t i, nf = jl_field_count(dta);
+    JL_GC_PUSH2(&a, &b);
+    a = jl_rewrap_unionall((jl_value_t*)dta->super, dta->name->wrapper);
+    b = jl_rewrap_unionall((jl_value_t*)dtb->super, dtb->name->wrapper);
+    if (!jl_types_equal(a, b))
+        goto no;
+    JL_TRY {
+        a = jl_apply_type(dtb->name->wrapper, jl_svec_data(dta->parameters), jl_nparams(dta));
+    }
+    JL_CATCH {
+        ok = 0;
+    }
+    if (!ok) goto no;
+    assert(jl_is_datatype(a));
+    a = dta->name->wrapper;
+    b = dtb->name->wrapper;
+    while (jl_is_unionall(a)) {
+        jl_unionall_t *ua = (jl_unionall_t*)a;
+        jl_unionall_t *ub = (jl_unionall_t*)b;
+        if (!jl_egal(ua->var->lb, ub->var->lb) || !jl_egal(ua->var->ub, ub->var->ub) ||
+            ua->var->name != ub->var->name)
+            goto no;
+        a = jl_instantiate_unionall(ua, (jl_value_t*)ub->var);
+        b = ub->body;
+    }
+    assert(jl_is_datatype(a) && jl_is_datatype(b));
+    for (i=0; i < nf; i++) {
+        jl_value_t *ta = jl_svecref(((jl_datatype_t*)a)->types, i);
+        jl_value_t *tb = jl_svecref(((jl_datatype_t*)b)->types, i);
+        if (jl_has_free_typevars(ta)) {
+            if (!jl_has_free_typevars(tb) || !jl_egal(ta, tb))
+                goto no;
+        }
+        else if (jl_has_free_typevars(tb) || jl_typeof(ta) != jl_typeof(tb) ||
+                 !jl_types_equal(ta, tb)) {
+            goto no;
+        }
+    }
+    JL_GC_POP();
+    return 1;
+ no:
+    JL_GC_POP();
+    return 0;
 }
 
-static void check_can_assign_type(jl_binding_t *b)
+static void check_can_assign_type(jl_binding_t *b, jl_value_t *rhs)
 {
-    if (b->constp && b->value != NULL && !jl_is_datatype(b->value))
+    if (b->constp && b->value != NULL && jl_typeof(b->value) != jl_typeof(rhs))
         jl_errorf("invalid redefinition of constant %s",
                   jl_symbol_name(b->name));
 }
@@ -124,9 +176,9 @@ void jl_set_datatype_super(jl_datatype_t *tt, jl_value_t *super)
 {
     if (!jl_is_datatype(super) || !jl_is_abstracttype(super) ||
         tt->name == ((jl_datatype_t*)super)->name ||
-        jl_subtype(super,(jl_value_t*)jl_vararg_type,0) ||
+        jl_subtype(super,(jl_value_t*)jl_vararg_type) ||
         jl_is_tuple_type(super) ||
-        jl_subtype(super,(jl_value_t*)jl_type_type,0) ||
+        jl_subtype(super,(jl_value_t*)jl_type_type) ||
         super == (jl_value_t*)jl_builtin_type) {
         jl_errorf("invalid subtyping in definition of %s",
                   jl_symbol_name(tt->name->name));
@@ -135,34 +187,34 @@ void jl_set_datatype_super(jl_datatype_t *tt, jl_value_t *super)
     jl_gc_wb(tt, tt->super);
 }
 
-static int jl_linfo_nslots(jl_lambda_info_t *li)
+static int jl_source_nslots(jl_code_info_t *src)
 {
-    return jl_array_len(li->slotflags);
+    return jl_array_len(src->slotflags);
 }
 
-static int jl_linfo_nssavalues(jl_lambda_info_t *li)
+static int jl_source_nssavalues(jl_code_info_t *src)
 {
-    return jl_is_long(li->ssavaluetypes) ? jl_unbox_long(li->ssavaluetypes) : jl_array_len(li->ssavaluetypes);
+    return jl_is_long(src->ssavaluetypes) ? jl_unbox_long(src->ssavaluetypes) : jl_array_len(src->ssavaluetypes);
 }
 
 static jl_value_t *eval(jl_value_t *e, interpreter_state *s)
 {
     jl_ptls_t ptls = jl_get_ptls_states();
-    jl_lambda_info_t *lam = s==NULL ? NULL : s->lam;
+    jl_code_info_t *src = s==NULL ? NULL : s->src;
     if (jl_is_ssavalue(e)) {
         ssize_t id = ((jl_ssavalue_t*)e)->id;
-        if (id >= jl_linfo_nssavalues(lam) || id < 0 || s->locals == NULL)
+        if (src == NULL || id >= jl_source_nssavalues(src) || id < 0 || s->locals == NULL)
             jl_error("access to invalid SSAValue");
         else
-            return s->locals[jl_linfo_nslots(lam) + id];
+            return s->locals[jl_source_nslots(src) + id];
     }
     if (jl_is_slot(e)) {
         ssize_t n = jl_slot_number(e);
-        if (n > jl_linfo_nslots(lam) || n < 1 || s->locals == NULL)
+        if (src == NULL || n > jl_source_nslots(src) || n < 1 || s->locals == NULL)
             jl_error("access to invalid slot number");
         jl_value_t *v = s->locals[n-1];
         if (v == NULL)
-            jl_undefined_var_error((jl_sym_t*)jl_array_ptr_ref(lam->slotnames,n-1));
+            jl_undefined_var_error((jl_sym_t*)jl_array_ptr_ref(src->slotnames, n - 1));
         return v;
     }
     if (jl_is_globalref(e)) {
@@ -174,7 +226,7 @@ static jl_value_t *eval(jl_value_t *e, interpreter_state *s)
     }
     if (jl_is_quotenode(e))
         return jl_fieldref(e,0);
-    jl_module_t *modu = (lam == NULL || lam->def == NULL) ? ptls->current_module : lam->def->module;
+    jl_module_t *modu = (s == NULL ? ptls->current_module : s->module);
     if (jl_is_symbol(e)) {  // bare symbols appear in toplevel exprs not wrapped in `thunk`
         jl_value_t *v = jl_get_global(modu, (jl_sym_t*)e);
         if (v == NULL)
@@ -207,12 +259,8 @@ static jl_value_t *eval(jl_value_t *e, interpreter_state *s)
     else if (ex->head == static_parameter_sym) {
         ssize_t n = jl_unbox_long(args[0]);
         assert(n > 0);
-        if (s->sparam_vals)
+        if (s->sparam_vals && n <= jl_svec_len(s->sparam_vals)) {
             return jl_svecref(s->sparam_vals, n - 1);
-        if (n <= jl_svec_len(lam->sparam_vals)) {
-            jl_value_t *sp = jl_svecref(lam->sparam_vals, n - 1);
-            if (!jl_is_typevar(sp))
-                return sp;
         }
         // static parameter val unknown needs to be an error for ccall
         jl_error("could not determine static parameter value");
@@ -228,6 +276,10 @@ static jl_value_t *eval(jl_value_t *e, interpreter_state *s)
     }
     else if (ex->head == method_sym) {
         jl_sym_t *fname = (jl_sym_t*)args[0];
+        if (jl_is_globalref(fname)) {
+            modu = jl_globalref_mod(fname);
+            fname = jl_globalref_name(fname);
+        }
         assert(jl_expr_nargs(ex) != 1 || jl_is_symbol(fname));
 
         if (jl_is_symbol(fname)) {
@@ -248,23 +300,34 @@ static jl_value_t *eval(jl_value_t *e, interpreter_state *s)
         JL_GC_PUSH2(&atypes, &meth);
         atypes = eval(args[1], s);
         meth = eval(args[2], s);
-        jl_method_def((jl_svec_t*)atypes, (jl_lambda_info_t*)meth, args[3]);
+        jl_method_def((jl_svec_t*)atypes, (jl_code_info_t*)meth, args[3]);
         JL_GC_POP();
         return jl_nothing;
     }
     else if (ex->head == const_sym) {
-        jl_value_t *sym = args[0];
+        jl_sym_t *sym = (jl_sym_t*)args[0];
+        if (jl_is_globalref(sym)) {
+            modu = jl_globalref_mod(sym);
+            sym = jl_globalref_name(sym);
+        }
         assert(jl_is_symbol(sym));
-        jl_binding_t *b = jl_get_binding_wr(modu, (jl_sym_t*)sym);
+        jl_binding_t *b = jl_get_binding_wr(modu, sym);
         jl_declare_constant(b);
         return (jl_value_t*)jl_nothing;
     }
     else if (ex->head == global_sym) {
         // create uninitialized mutable binding for "global x" decl
         // TODO: handle type decls
-        for (size_t i=0; i < jl_array_len(ex->args); i++) {
-            assert(jl_is_symbol(args[i]));
-            jl_get_binding_wr(modu, (jl_sym_t*)args[i]);
+        size_t i, l = jl_array_len(ex->args);
+        for (i = 0; i < l; i++) {
+            jl_sym_t *gsym = (jl_sym_t*)args[i];
+            jl_module_t *gmodu = modu;
+            if (jl_is_globalref(gsym)) {
+                gmodu = jl_globalref_mod(gsym);
+                gsym = jl_globalref_name(gsym);
+            }
+            assert(jl_is_symbol(gsym));
+            jl_get_binding_wr(gmodu, gsym);
         }
         return (jl_value_t*)jl_nothing;
     }
@@ -276,15 +339,21 @@ static jl_value_t *eval(jl_value_t *e, interpreter_state *s)
         jl_value_t *super = NULL;
         jl_value_t *temp = NULL;
         jl_datatype_t *dt = NULL;
-        JL_GC_PUSH4(&para, &super, &temp, &dt);
+        jl_value_t *w = NULL;
+        JL_GC_PUSH4(&para, &super, &temp, &w);
         assert(jl_is_svec(para));
+        if (jl_is_globalref(name)) {
+            modu = jl_globalref_mod(name);
+            name = (jl_value_t*)jl_globalref_name(name);
+        }
         assert(jl_is_symbol(name));
         dt = jl_new_abstracttype(name, NULL, (jl_svec_t*)para);
+        w = dt->name->wrapper;
         jl_binding_t *b = jl_get_binding_wr(modu, (jl_sym_t*)name);
         temp = b->value;
-        check_can_assign_type(b);
-        b->value = (jl_value_t*)dt;
-        jl_gc_wb_binding(b, dt);
+        check_can_assign_type(b, w);
+        b->value = w;
+        jl_gc_wb_binding(b, w);
         JL_TRY {
             inside_typedef = 1;
             super = eval(args[2], s);
@@ -297,8 +366,8 @@ static jl_value_t *eval(jl_value_t *e, interpreter_state *s)
             jl_rethrow();
         }
         b->value = temp;
-        if (temp==NULL || !equiv_type(dt, (jl_datatype_t*)temp)) {
-            jl_checked_assignment(b, (jl_value_t*)dt);
+        if (temp == NULL || !equiv_type(dt, (jl_datatype_t*)jl_unwrap_unionall(temp))) {
+            jl_checked_assignment(b, w);
         }
         JL_GC_POP();
         return (jl_value_t*)jl_nothing;
@@ -309,7 +378,12 @@ static jl_value_t *eval(jl_value_t *e, interpreter_state *s)
         jl_value_t *name = args[0];
         jl_value_t *super = NULL, *para = NULL, *vnb = NULL, *temp = NULL;
         jl_datatype_t *dt = NULL;
-        JL_GC_PUSH4(&para, &super, &temp, &dt);
+        jl_value_t *w = NULL;
+        JL_GC_PUSH4(&para, &super, &temp, &w);
+        if (jl_is_globalref(name)) {
+            modu = jl_globalref_mod(name);
+            name = (jl_value_t*)jl_globalref_name(name);
+        }
         assert(jl_is_symbol(name));
         para = eval(args[1], s);
         assert(jl_is_svec(para));
@@ -321,12 +395,13 @@ static jl_value_t *eval(jl_value_t *e, interpreter_state *s)
         if (nb < 1 || nb>=(1<<23) || (nb&7) != 0)
             jl_errorf("invalid number of bits in type %s",
                       jl_symbol_name((jl_sym_t*)name));
-        dt = jl_new_bitstype(name, NULL, (jl_svec_t*)para, nb);
+        dt = jl_new_primitivetype(name, NULL, (jl_svec_t*)para, nb);
+        w = dt->name->wrapper;
         jl_binding_t *b = jl_get_binding_wr(modu, (jl_sym_t*)name);
         temp = b->value;
-        check_can_assign_type(b);
-        b->value = (jl_value_t*)dt;
-        jl_gc_wb_binding(b, dt);
+        check_can_assign_type(b, w);
+        b->value = w;
+        jl_gc_wb_binding(b, w);
         JL_TRY {
             inside_typedef = 1;
             super = eval(args[3], s);
@@ -339,8 +414,8 @@ static jl_value_t *eval(jl_value_t *e, interpreter_state *s)
             jl_rethrow();
         }
         b->value = temp;
-        if (temp==NULL || !equiv_type(dt, (jl_datatype_t*)temp)) {
-            jl_checked_assignment(b, (jl_value_t*)dt);
+        if (temp == NULL || !equiv_type(dt, (jl_datatype_t*)jl_unwrap_unionall(temp))) {
+            jl_checked_assignment(b, w);
         }
         JL_GC_POP();
         return (jl_value_t*)jl_nothing;
@@ -349,30 +424,30 @@ static jl_value_t *eval(jl_value_t *e, interpreter_state *s)
         if (inside_typedef)
             jl_error("cannot eval a new data type definition while defining another type");
         jl_value_t *name = args[0];
-        assert(jl_is_symbol(name));
         jl_value_t *para = eval(args[1], s);
-        assert(jl_is_svec(para));
         jl_value_t *temp = NULL;
         jl_value_t *super = NULL;
         jl_datatype_t *dt = NULL;
-        JL_GC_PUSH4(&para, &super, &temp, &dt);
-        temp = eval(args[2], s);  // field names
-#ifndef NDEBUG
-        size_t i, l = jl_svec_len(para);
-        for (i = 0; i < l; i++) {
-            assert(!((jl_tvar_t*)jl_svecref(para, i))->bound);
+        jl_value_t *w = NULL;
+        JL_GC_PUSH4(&para, &super, &temp, &w);
+        if (jl_is_globalref(name)) {
+            modu = jl_globalref_mod(name);
+            name = (jl_value_t*)jl_globalref_name(name);
         }
-#endif
+        assert(jl_is_symbol(name));
+        assert(jl_is_svec(para));
+        temp = eval(args[2], s);  // field names
         dt = jl_new_datatype((jl_sym_t*)name, NULL, (jl_svec_t*)para,
                              (jl_svec_t*)temp, NULL,
                              0, args[5]==jl_true ? 1 : 0, jl_unbox_long(args[6]));
+        w = dt->name->wrapper;
 
         jl_binding_t *b = jl_get_binding_wr(modu, (jl_sym_t*)name);
         temp = b->value;  // save old value
         // temporarily assign so binding is available for field types
-        check_can_assign_type(b);
-        b->value = (jl_value_t*)dt;
-        jl_gc_wb_binding(b,dt);
+        check_can_assign_type(b, w);
+        b->value = w;
+        jl_gc_wb_binding(b,w);
 
         JL_TRY {
             inside_typedef = 1;
@@ -395,18 +470,18 @@ static jl_value_t *eval(jl_value_t *e, interpreter_state *s)
             b->value = temp;
             jl_rethrow();
         }
-        jl_compute_field_offsets(dt);
+        if (dt->name->names == jl_emptysvec)
+            dt->layout = jl_void_type->layout; // reuse the same layout for all singletons
+        else if (jl_is_leaf_type((jl_value_t*)dt))
+            jl_compute_field_offsets(dt);
         if (para == (jl_value_t*)jl_emptysvec && jl_is_datatype_make_singleton(dt)) {
             dt->instance = jl_gc_alloc(ptls, 0, dt);
             jl_gc_wb(dt, dt->instance);
         }
 
         b->value = temp;
-        if (temp==NULL || !equiv_type(dt, (jl_datatype_t*)temp)) {
-            jl_checked_assignment(b, (jl_value_t*)dt);
-        }
-        else {
-            // TODO: remove all old ctors and set temp->name->ctor_factory = dt->name->ctor_factory
+        if (temp == NULL || !equiv_type(dt, (jl_datatype_t*)jl_unwrap_unionall(temp))) {
+            jl_checked_assignment(b, w);
         }
 
         JL_GC_POP();
@@ -435,7 +510,10 @@ static jl_value_t *eval(jl_value_t *e, interpreter_state *s)
 
 jl_value_t *jl_toplevel_eval_body(jl_array_t *stmts)
 {
-    return eval_body(stmts, NULL, 0, 1);
+    size_t last_age = jl_get_ptls_states()->world_age;
+    jl_value_t *ret = eval_body(stmts, NULL, 0, 1);
+    jl_get_ptls_states()->world_age = last_age;
+    return ret;
 }
 
 static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, int start, int toplevel)
@@ -447,15 +525,17 @@ static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, int start,
     while (1) {
         if (i >= ns)
             jl_error("`body` expression must terminate in `return`. Use `block` instead.");
-        jl_value_t *stmt = jl_array_ptr_ref(stmts,i);
+        if (toplevel)
+            jl_get_ptls_states()->world_age = jl_world_counter;
+        jl_value_t *stmt = jl_array_ptr_ref(stmts, i);
         if (jl_is_gotonode(stmt)) {
-            i = jl_gotonode_label(stmt)-1;
+            i = jl_gotonode_label(stmt) - 1;
             continue;
         }
         else if (jl_is_expr(stmt)) {
             jl_sym_t *head = ((jl_expr_t*)stmt)->head;
             if (head == return_sym) {
-                jl_value_t *ex = jl_exprarg(stmt,0);
+                jl_value_t *ex = jl_exprarg(stmt, 0);
                 if (toplevel && jl_is_toplevel_only_expr(ex))
                     return jl_toplevel_eval(ex);
                 else
@@ -463,16 +543,16 @@ static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, int start,
             }
             else if (head == assign_sym) {
                 jl_value_t *sym = jl_exprarg(stmt, 0);
-                jl_value_t *rhs = eval(jl_exprarg(stmt,1), s);
+                jl_value_t *rhs = eval(jl_exprarg(stmt, 1), s);
                 if (jl_is_ssavalue(sym)) {
                     ssize_t genid = ((jl_ssavalue_t*)sym)->id;
-                    if (genid >= jl_linfo_nssavalues(s->lam) || genid < 0)
+                    if (genid >= jl_source_nssavalues(s->src) || genid < 0)
                         jl_error("assignment to invalid GenSym location");
-                    s->locals[jl_linfo_nslots(s->lam) + genid] = rhs;
+                    s->locals[jl_source_nslots(s->src) + genid] = rhs;
                 }
                 else if (jl_is_slot(sym)) {
                     ssize_t n = jl_slot_number(sym);
-                    assert(n <= jl_linfo_nslots(s->lam) && n > 0);
+                    assert(n <= jl_source_nslots(s->src) && n > 0);
                     s->locals[n-1] = rhs;
                 }
                 else {
@@ -482,7 +562,7 @@ static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, int start,
                         sym = (jl_value_t*)jl_globalref_name(sym);
                     }
                     else {
-                        m = (s==NULL || s->lam==NULL || s->lam->def==NULL) ? ptls->current_module : s->lam->def->module;
+                        m = (s == NULL ? ptls->current_module : s->module);
                     }
                     assert(jl_is_symbol(sym));
                     JL_GC_PUSH1(&rhs);
@@ -492,9 +572,9 @@ static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, int start,
                 }
             }
             else if (head == goto_ifnot_sym) {
-                jl_value_t *cond = eval(jl_exprarg(stmt,0), s);
+                jl_value_t *cond = eval(jl_exprarg(stmt, 0), s);
                 if (cond == jl_false) {
-                    i = jl_unbox_long(jl_exprarg(stmt, 1))-1;
+                    i = jl_unbox_long(jl_exprarg(stmt, 1)) - 1;
                     continue;
                 }
                 else if (cond != jl_true) {
@@ -503,20 +583,20 @@ static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, int start,
             }
             else if (head == line_sym) {
                 if (toplevel)
-                    jl_lineno = jl_unbox_long(jl_exprarg(stmt,0));
+                    jl_lineno = jl_unbox_long(jl_exprarg(stmt, 0));
                 // TODO: interpreted function line numbers
             }
             else if (head == enter_sym) {
                 jl_enter_handler(&__eh);
                 if (!jl_setjmp(__eh.eh_ctx,1)) {
-                    return eval_body(stmts, s, i+1, toplevel);
+                    return eval_body(stmts, s, i + 1, toplevel);
                 }
                 else {
 #ifdef _OS_WINDOWS_
                     if (ptls->exception_in_transit == jl_stackovf_exception)
                         _resetstkoflw();
 #endif
-                    i = jl_unbox_long(jl_exprarg(stmt,0))-1;
+                    i = jl_unbox_long(jl_exprarg(stmt, 0)) - 1;
                     continue;
                 }
             }
@@ -537,11 +617,11 @@ static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, int start,
             // TODO: interpreted function line numbers
         }
         else if (jl_is_newvarnode(stmt)) {
-            jl_value_t *var = jl_fieldref(stmt,0);
+            jl_value_t *var = jl_fieldref(stmt, 0);
             assert(jl_is_slot(var));
             ssize_t n = jl_slot_number(var);
-            assert(n <= jl_linfo_nslots(s->lam) && n > 0);
-            s->locals[n-1] = NULL;
+            assert(n <= jl_source_nslots(s->src) && n > 0);
+            s->locals[n - 1] = NULL;
         }
         else {
             eval(stmt, s);
@@ -552,29 +632,70 @@ static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, int start,
     return NULL;
 }
 
-jl_value_t *jl_interpret_call(jl_lambda_info_t *lam, jl_value_t **args, uint32_t nargs, jl_svec_t *sparam_vals)
+jl_value_t *jl_interpret_call(jl_method_instance_t *lam, jl_value_t **args, uint32_t nargs)
 {
-    jl_array_t *stmts = (jl_array_t*)lam->code;
+    if (lam->jlcall_api == 2)
+        return lam->inferred_const;
+    jl_code_info_t *src = (jl_code_info_t*)lam->inferred;
+    if (!src || (jl_value_t*)src == jl_nothing) {
+        if (lam->def->isstaged) {
+            src = jl_code_for_staged(lam);
+            lam->inferred = (jl_value_t*)src;
+            jl_gc_wb(lam, src);
+        }
+        else {
+            src = (jl_code_info_t*)lam->def->source;
+        }
+    }
+    if (src && (jl_value_t*)src != jl_nothing) {
+        src = jl_uncompress_ast(lam->def, (jl_array_t*)src);
+        lam->inferred = (jl_value_t*)src;
+        jl_gc_wb(lam, src);
+    }
+    if (!src || !jl_is_code_info(src)) {
+        jl_error("source missing for method called in interpreter");
+    }
+
+    jl_array_t *stmts = src->code;
     assert(jl_typeis(stmts, jl_array_any_type));
     jl_value_t **locals;
-    JL_GC_PUSHARGS(locals, jl_linfo_nslots(lam) + jl_linfo_nssavalues(lam));
+    JL_GC_PUSHARGS(locals, jl_source_nslots(src) + jl_source_nssavalues(src) + 2);
+    locals[0] = (jl_value_t*)src;
+    locals[1] = (jl_value_t*)stmts;
     interpreter_state s;
-    s.lam = lam; s.locals = locals; s.sparam_vals = sparam_vals;
+    s.src = src;
+    s.module = lam->def->module;
+    s.locals = locals + 2;
+    s.sparam_vals = lam->sparam_vals;
     size_t i;
-    for(i=0; i < lam->nargs; i++) {
-        if (lam->isva && i == lam->nargs-1)
-            locals[i] = jl_f_tuple(NULL, &args[i], nargs-i);
+    for (i = 0; i < lam->def->nargs; i++) {
+        if (lam->def->isva && i == lam->def->nargs - 1)
+            s.locals[i] = jl_f_tuple(NULL, &args[i], nargs - i);
         else
-            locals[i] = args[i];
+            s.locals[i] = args[i];
     }
-    jl_value_t *r = eval_body(stmts, &s, 0, lam->nargs==0);
+    jl_value_t *r = eval_body(stmts, &s, 0, 0);
     JL_GC_POP();
     return r;
 }
 
-jl_value_t *jl_interpret_toplevel_thunk(jl_lambda_info_t *lam)
+jl_value_t *jl_interpret_toplevel_thunk(jl_code_info_t *src)
 {
-    return jl_interpret_call(lam, NULL, 0, NULL);
+    jl_ptls_t ptls = jl_get_ptls_states();
+    jl_array_t *stmts = src->code;
+    assert(jl_typeis(stmts, jl_array_any_type));
+    jl_value_t **locals;
+    JL_GC_PUSHARGS(locals, jl_source_nslots(src) + jl_source_nssavalues(src));
+    interpreter_state s;
+    s.src = src;
+    s.locals = locals;
+    s.module = ptls->current_module;
+    s.sparam_vals = jl_emptysvec;
+    size_t last_age = jl_get_ptls_states()->world_age;
+    jl_value_t *r = eval_body(stmts, &s, 0, 1);
+    jl_get_ptls_states()->world_age = last_age;
+    JL_GC_POP();
+    return r;
 }
 
 #ifdef __cplusplus

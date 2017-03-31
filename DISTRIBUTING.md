@@ -104,10 +104,10 @@ completely self-contained Julia.app.
 
 Note that if you want your `.app` to be able to run on OSX 10.6 Snow
 Leopard, you must pass `USE_SYSTEM_LIBUNWIND=1` as one of the make
-variables passed to both `make` processes.  This disables the use of
+variables passed to both `make` processes. This disables the use of
 `libosxunwind`, a more modern libunwind that relies on OS features
-available only in 10.7+.  This is the reason why we offer [separate
-downloads](http://julialang.org/downloads/) for OS X 10.6 and 10.7+.
+available only in 10.7+. Furthermore, support for OSX 10.6 and 10.7
+requires that Julia is built with `USE_LIBCPP=0`.
 
 Windows
 -------

@@ -1,6 +1,11 @@
 # This file is a part of Julia. License is MIT: http://julialang.org/license
 
-type SystemError <: Exception
+"""
+    SystemError(prefix::AbstractString, [errno::Int32])
+
+A system call failed with an error code (in the `errno` global variable).
+"""
+mutable struct SystemError <: Exception
     prefix::AbstractString
     errnum::Int32
     extrainfo
@@ -9,52 +14,103 @@ type SystemError <: Exception
     SystemError(p::AbstractString) = new(p, Libc.errno())
 end
 
-type ParseError <: Exception
+"""
+    ParseError(msg)
+
+The expression passed to the `parse` function could not be interpreted as a valid Julia
+expression.
+"""
+mutable struct ParseError <: Exception
     msg::AbstractString
 end
 
-type ArgumentError <: Exception
+"""
+    ArgumentError(msg)
+
+The parameters to a function call do not match a valid signature. Argument `msg` is a
+descriptive error string.
+"""
+mutable struct ArgumentError <: Exception
     msg::AbstractString
 end
 
-#type UnboundError <: Exception
-#    var::Symbol
-#end
+"""
+    KeyError(key)
 
-type KeyError <: Exception
+An indexing operation into an `Associative` (`Dict`) or `Set` like object tried to access or
+delete a non-existent element.
+"""
+mutable struct KeyError <: Exception
     key
 end
 
-type MethodError <: Exception
+"""
+    MethodError(f, args)
+
+A method with the required type signature does not exist in the given generic function.
+Alternatively, there is no unique most-specific method.
+"""
+mutable struct MethodError <: Exception
     f
     args
+    world::UInt
+    MethodError(f::ANY, args::ANY, world::UInt) = new(f, args, world)
 end
+MethodError(f::ANY, args::ANY) = MethodError(f, args, typemax(UInt))
 
-type EOFError <: Exception end
+"""
+    EOFError()
 
-type DimensionMismatch <: Exception
+No more data was available to read from a file or stream.
+"""
+mutable struct EOFError <: Exception end
+
+"""
+    DimensionMismatch([msg])
+
+The objects called do not have matching dimensionality. Optional argument `msg` is a
+descriptive error string.
+"""
+mutable struct DimensionMismatch <: Exception
     msg::AbstractString
 end
 DimensionMismatch() = DimensionMismatch("")
 
-type AssertionError <: Exception
-    msg::AbstractString
+"""
+    AssertionError([msg])
 
+The asserted condition did not evaluate to `true`.
+Optional argument `msg` is a descriptive error string.
+"""
+mutable struct AssertionError <: Exception
+    msg::AbstractString
     AssertionError() = new("")
     AssertionError(msg) = new(msg)
 end
 
 #Generic wrapping of arbitrary exceptions
 #Subtypes should put the exception in an 'error' field
-abstract WrappedException <: Exception
+abstract type WrappedException <: Exception end
 
-type LoadError <: WrappedException
+"""
+    LoadError(file::AbstractString, line::Int, error)
+
+An error occurred while `include`ing, `require`ing, or `using` a file. The error specifics
+should be available in the `.error` field.
+"""
+mutable struct LoadError <: WrappedException
     file::AbstractString
     line::Int
     error
 end
 
-type InitError <: WrappedException
+"""
+    InitError(mod::Symbol, error)
+
+An error occurred when running a module's `__init__` function. The actual error thrown is
+available in the `.error` field.
+"""
+mutable struct InitError <: WrappedException
     mod::Symbol
     error
 end
@@ -85,23 +141,13 @@ end
 finalize(o::ANY) = ccall(:jl_finalize_th, Void, (Ptr{Void}, Any,),
                          Core.getptls(), o)
 
-gc(full::Bool=true) = ccall(:jl_gc_collect, Void, (Cint,), full)
-gc_enable(on::Bool) = ccall(:jl_gc_enable, Cint, (Cint,), on)!=0
+gc(full::Bool=true) = ccall(:jl_gc_collect, Void, (Int32,), full)
+gc_enable(on::Bool) = ccall(:jl_gc_enable, Int32, (Int32,), on) != 0
 
-# used by interpolating quote and some other things in the front end
-function vector_any(xs::ANY...)
-    n = length(xs)
-    a = Array{Any}(n)
-    @inbounds for i = 1:n
-        arrayset(a,xs[i],i)
-    end
-    a
-end
-
-immutable Nullable{T}
-    isnull::Bool
+struct Nullable{T}
+    hasvalue::Bool
     value::T
 
-    Nullable() = new(true)
-    Nullable(value::T, isnull::Bool=false) = new(isnull, value)
+    Nullable{T}() where {T} = new(false)
+    Nullable{T}(value::T, hasvalue::Bool=true) where {T} = new(hasvalue, value)
 end

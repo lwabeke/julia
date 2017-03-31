@@ -1,7 +1,24 @@
 # This file is a part of Julia. License is MIT: http://julialang.org/license
 
+# issue #19892
+# (test this first to make sure it happens before set_num_threads)
+let a = randn(10^5,1), p1 = plan_rfft(a, flags=FFTW.ESTIMATE)
+    FFTW.set_num_threads(2)
+    p2 = plan_rfft(a, flags=FFTW.ESTIMATE)
+    @test p1*a ≈ p2*a
+    # make sure threads are actually being used for p2
+    # (tests #21163).
+    @test !contains(string(p1), "dft-thr")
+    @test contains(string(p2), "dft-thr")
+end
+
 # fft
 a = rand(8) + im*rand(8)
+@test norm(ifft(fft(a)) - a) < 1e-8
+@test norm(ifft(fft(a,1),1) - a) < 1e-8
+@test norm(ifft(fft(a,[1]),[1]) - a) < 1e-8
+@test norm(ifft(fft(a,(1,)),(1,)) - a) < 1e-8
+a = rand(-10:10, 8) + im*rand(-10:10, 8)
 @test norm(ifft(fft(a)) - a) < 1e-8
 
 m4 = [16.    2     3    13;
@@ -249,14 +266,14 @@ function fft_test{T<:Complex}(p::Base.DFT.Plan{T}, ntrials=4,
         z = zeros(T, n)
         i = rand(0:n-1)
         z[i+1] = 1
-        X = exp(twopi_i*i)
+        X = exp.(twopi_i*i)
         err = norm(p*z - X, Inf) / norm(X, Inf)
         err <= tol || error("impulse-response error $err in $p")
 
         # time-shift:
         if n > 1
             s = rand(1:n-1)
-            X = (p*x).*exp(twopi_i*s)
+            X = (p*x).*exp.(twopi_i*s)
             err = norm(p*circshift(x,s) - X, Inf) / norm(X, Inf)
             err <= tol || error("time-shift error $err in $p")
         end
@@ -323,3 +340,11 @@ for x in (randn(10),randn(10,12))
     # note: inference doesn't work for plan_fft_ since the
     #       algorithm steps are included in the CTPlan type
 end
+
+# issue #17896
+a = rand(5)
+@test  fft(a) ==  fft(view(a,:)) ==  fft(view(a, 1:5)) ==  fft(view(a, [1:5;]))
+@test rfft(a) == rfft(view(a,:)) == rfft(view(a, 1:5)) == rfft(view(a, [1:5;]))
+a16 = convert(Vector{Float16}, a)
+@test  fft(a16) ==  fft(view(a16,:)) ==  fft(view(a16, 1:5)) ==  fft(view(a16, [1:5;]))
+@test rfft(a16) == rfft(view(a16,:)) == rfft(view(a16, 1:5)) == rfft(view(a16, [1:5;]))

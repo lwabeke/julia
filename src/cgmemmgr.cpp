@@ -6,15 +6,18 @@
 
 #ifdef USE_MCJIT
 #include <llvm/ExecutionEngine/SectionMemoryManager.h>
+#include "fix_llvm_assert.h"
 #include "julia.h"
 #include "julia_internal.h"
 
-#ifdef LLVM37
-#ifndef LLVM38
+#if JL_LLVM_VERSION >= 30700
+#if JL_LLVM_VERSION < 30800
 #  include <llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h>
+#  include "fix_llvm_assert.h"
 #endif
 #ifdef _OS_LINUX_
 #  include <sys/syscall.h>
+#  include <sys/utsname.h>
 #endif
 #ifndef _OS_WINDOWS_
 #  include <sys/mman.h>
@@ -47,7 +50,7 @@ static void *map_anon_page(size_t size)
     mem = (char*)LLT_ALIGN(uintptr_t(mem), jl_page_size);
 #else // _OS_WINDOWS_
     void *mem = mmap(nullptr, size, PROT_READ | PROT_WRITE,
-                     MAP_NORESERVE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     assert(mem != MAP_FAILED && "Cannot allocate RW memory");
 #endif // _OS_WINDOWS_
     return mem;
@@ -141,13 +144,18 @@ static intptr_t init_shared_map()
 static void *alloc_shared_page(size_t size, size_t *id, bool exec)
 {
     assert(size % jl_page_size == 0);
-    auto file_mode = exec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
+    DWORD file_mode = exec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
     HANDLE hdl = CreateFileMapping(INVALID_HANDLE_VALUE, NULL,
                                    file_mode, 0, size, NULL);
     *id = (size_t)hdl;
-    auto map_mode = FILE_MAP_READ | (exec ? FILE_MAP_EXECUTE : 0);
+    // We set the maximum permissions for this to the maximum for this file, and then
+    // VirtualProtect, such that the debugger can still access these
+    // pages and set breakpoints if it wants to.
+    DWORD map_mode = FILE_MAP_ALL_ACCESS | (exec ? FILE_MAP_EXECUTE : 0);
     void *addr = MapViewOfFile(hdl, map_mode, 0, 0, size);
     assert(addr && "Cannot map RO view");
+    DWORD protect_mode = exec ? PAGE_EXECUTE_READ : PAGE_READONLY;
+    VirtualProtect(addr, size, protect_mode, &file_mode);
     return addr;
 }
 #else // _OS_WINDOWS_
@@ -260,6 +268,16 @@ static int self_mem_fd = -1;
 
 static int init_self_mem()
 {
+    struct utsname kernel;
+    uname(&kernel);
+    int major, minor;
+    if (-1 == sscanf(kernel.release, "%d.%d", &major, &minor))
+        return -1;
+    // Can't risk getting a memory block backed by transparent huge pages,
+    // which cause the kernel to freeze on systems that have the DirtyCOW
+    // mitigation patch, but are < 4.10.
+    if (!(major > 4 || (major == 4 && minor >= 10)))
+        return -1;
 #ifdef O_CLOEXEC
     int fd = open("/proc/self/mem", O_RDWR | O_SYNC | O_CLOEXEC);
     if (fd == -1)
@@ -290,7 +308,7 @@ static void write_self_mem(void *dest, void *ptr, size_t size)
             return;
         if (ret == -1 && (errno == EAGAIN || errno == EINTR))
             continue;
-        assert(ret < size);
+        assert((size_t)ret < size);
         size -= ret;
         ptr = (char*)ptr + ret;
         dest = (char*)dest + ret;
@@ -457,11 +475,12 @@ public:
     virtual ~ROAllocator() {}
     virtual void finalize()
     {
-        if (exec) {
-            for (auto &alloc: allocations) {
-                sys::Memory::InvalidateInstructionCache(alloc.rt_addr,
-                                                        alloc.sz);
-            }
+        for (auto &alloc: allocations) {
+            // ensure the mapped pages are consistent
+            sys::Memory::InvalidateInstructionCache(alloc.wr_addr,
+                                                    alloc.sz);
+            sys::Memory::InvalidateInstructionCache(alloc.rt_addr,
+                                                    alloc.sz);
         }
         completed.clear();
         allocations.clear();
@@ -721,7 +740,8 @@ public:
     uint8_t *allocateDataSection(uintptr_t Size, unsigned Alignment,
                                  unsigned SectionID, StringRef SectionName,
                                  bool isReadOnly) override;
-#ifdef LLVM38
+#if JL_LLVM_VERSION >= 30800
+    using SectionMemoryManager::notifyObjectLoaded;
     void notifyObjectLoaded(RuntimeDyld &Dyld,
                             const object::ObjectFile &Obj) override;
 #endif
@@ -796,7 +816,7 @@ uint8_t *RTDyldMemoryManagerJL::allocateDataSection(uintptr_t Size,
                                                      SectionName, isReadOnly);
 }
 
-#ifdef LLVM38
+#if JL_LLVM_VERSION >= 30800
 void RTDyldMemoryManagerJL::notifyObjectLoaded(RuntimeDyld &Dyld,
                                                const object::ObjectFile &Obj)
 {
@@ -849,7 +869,7 @@ void RTDyldMemoryManagerJL::deregisterEHFrames(uint8_t *Addr,
 
 }
 
-#ifndef LLVM38
+#if JL_LLVM_VERSION < 30800
 void notifyObjectLoaded(RTDyldMemoryManager *memmgr,
                         llvm::orc::ObjectLinkingLayerBase::ObjSetHandleT H)
 {
@@ -864,9 +884,9 @@ void *lookupWriteAddressFor(RTDyldMemoryManager *memmgr, void *rt_addr)
 }
 #endif
 
-#else // LLVM37
+#else // JL_LLVM_VERSION >= 30700
 typedef SectionMemoryManager RTDyldMemoryManagerJL;
-#endif // LLVM37
+#endif // JL_LLVM_VERSION >= 30700
 
 RTDyldMemoryManager* createRTDyldMemoryManager()
 {

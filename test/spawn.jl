@@ -1,55 +1,57 @@
 # This file is a part of Julia. License is MIT: http://julialang.org/license
 
-##################################
-# Cross Plaform tests for spawn. #
-##################################
+###################################
+# Cross Platform tests for spawn. #
+###################################
 
 valgrind_off = ccall(:jl_running_on_valgrind, Cint, ()) == 0
 
-yes = `perl -le 'while (1) {print STDOUT "y"}'`
-echo = `echo`
+yescmd = `yes`
+echocmd = `echo`
 sortcmd = `sort`
-printf = `printf`
+printfcmd = `printf`
 truecmd = `true`
 falsecmd = `false`
 catcmd = `cat`
 shcmd = `sh`
 sleepcmd = `sleep`
+lscmd = `ls`
 if is_windows()
     try # use busybox-w32 on windows
         success(`busybox`)
-        yes = `busybox yes`
-        echo = `busybox echo`
+        yescmd = `busybox yes`
+        echocmd = `busybox echo`
         sortcmd = `busybox sort`
-        printf = `busybox printf`
+        printfcmd = `busybox printf`
         truecmd = `busybox true`
         falsecmd = `busybox false`
         catcmd = `busybox cat`
         shcmd = `busybox sh`
         sleepcmd = `busybox sleep`
+        lscmd = `busybox ls`
     end
 end
 
 #### Examples used in the manual ####
 
-@test readstring(`$echo hello | sort`) == "hello | sort\n"
-@test readstring(pipeline(`$echo hello`, sortcmd)) == "hello\n"
-@test length(spawn(pipeline(`$echo hello`, sortcmd)).processes) == 2
+@test readstring(`$echocmd hello \| sort`) == "hello | sort\n"
+@test readstring(pipeline(`$echocmd hello`, sortcmd)) == "hello\n"
+@test length(spawn(pipeline(`$echocmd hello`, sortcmd)).processes) == 2
 
-out = readstring(`$echo hello` & `$echo world`)
+out = readstring(`$echocmd hello` & `$echocmd world`)
 @test search(out,"world") != 0:-1
 @test search(out,"hello") != 0:-1
-@test readstring(pipeline(`$echo hello` & `$echo world`, sortcmd)) == "hello\nworld\n"
+@test readstring(pipeline(`$echocmd hello` & `$echocmd world`, sortcmd)) == "hello\nworld\n"
 
-@test (run(`$printf "       \033[34m[stdio passthrough ok]\033[0m\n"`); true)
+@test (run(`$printfcmd "       \033[34m[stdio passthrough ok]\033[0m\n"`); true)
 
 # Test for SIGPIPE being treated as normal termination (throws an error if broken)
-is_unix() && run(pipeline(yes, `head`, DevNull))
+is_unix() && run(pipeline(yescmd, `head`, DevNull))
 
 begin
     a = Base.Condition()
     @schedule begin
-        p = spawn(pipeline(yes,DevNull))
+        p = spawn(pipeline(yescmd,DevNull))
         Base.notify(a,p)
         @test !success(p)
     end
@@ -64,12 +66,12 @@ if valgrind_off
 end
 
 if is_unix()
-    prefixer(prefix, sleep) = `perl -nle '$|=1; print "'$prefix' ", $_; sleep '$sleep';'`
-    @test success(pipeline(`perl -le '$|=1; for(0..2){ print; sleep 1 }'`,
-                       prefixer("A",2) & prefixer("B",2)))
-    @test success(pipeline(`perl -le '$|=1; for(0..2){ print; sleep 1 }'`,
-                       prefixer("X",3) & prefixer("Y",3) & prefixer("Z",3),
-                       prefixer("A",2) & prefixer("B",2)))
+    prefixer(prefix, sleep) = `sh -c "while IFS= read REPLY; do echo '$prefix ' \$REPLY; sleep $sleep; done"`
+    @test success(pipeline(`sh -c "for i in 1 2 3 4 5 6 7 8 9 10; do echo \$i; sleep 0.1; done"`,
+                       prefixer("A", 0.2) & prefixer("B", 0.2)))
+    @test success(pipeline(`sh -c "for i in 1 2 3 4 5 6 7 8 9 10; do echo \$i; sleep 0.1; done"`,
+                       prefixer("X", 0.3) & prefixer("Y", 0.3) & prefixer("Z", 0.3),
+                       prefixer("A", 0.2) & prefixer("B", 0.2)))
 end
 
 @test  success(truecmd)
@@ -83,27 +85,33 @@ end
 @test_broken  success(ignorestatus(falsecmd & falsecmd))
 
 # STDIN Redirection
-file = tempname()
-run(pipeline(`$echo hello world`, file))
-@test readstring(pipeline(file, catcmd)) == "hello world\n"
-@test open(readstring, pipeline(file, catcmd), "r") == "hello world\n"
-rm(file)
+let file = tempname()
+    run(pipeline(`$echocmd hello world`, file))
+    @test readstring(pipeline(file, catcmd)) == "hello world\n"
+    @test open(readstring, pipeline(file, catcmd), "r") == "hello world\n"
+    rm(file)
+end
 
 # Stream Redirection
 if !is_windows() # WINNT reports operation not supported on socket (ENOTSUP) for this test
-    local r = Channel(1), port, server, sock, client
-    @async begin
+    local r = Channel(1)
+    local port, server, sock, client, t1, t2
+    t1 = @async begin
         port, server = listenany(2326)
         put!(r, port)
         client = accept(server)
         @test readstring(pipeline(client, catcmd)) == "hello world\n"
         close(server)
+        return true
     end
-    @async begin
+    t2 = @async begin
         sock = connect(fetch(r))
-        run(pipeline(`$echo hello world`, sock))
+        run(pipeline(`$echocmd hello world`, sock))
         close(sock)
+        return true
     end
+    @test wait(t1)
+    @test wait(t2)
 end
 
 @test readstring(setenv(`$shcmd -c "echo \$TEST"`,["TEST=Hello World"])) == "Hello World\n"
@@ -111,78 +119,87 @@ end
 @test readstring(setenv(`$shcmd -c "echo \$TEST"`,"TEST"=>"Hello World")) == "Hello World\n"
 @test (withenv("TEST"=>"Hello World") do
        readstring(`$shcmd -c "echo \$TEST"`); end) == "Hello World\n"
-pathA = readchomp(setenv(`$shcmd -c "pwd -P"`;dir=".."))
-pathB = readchomp(setenv(`$shcmd -c "cd .. && pwd -P"`))
-if is_windows()
-    # on windows, sh returns posix-style paths that are not valid according to ispath
-    @test pathA == pathB
-else
-    @test Base.samefile(pathA, pathB)
+let pathA = readchomp(setenv(`$shcmd -c "pwd -P"`;dir="..")),
+    pathB = readchomp(setenv(`$shcmd -c "cd .. && pwd -P"`))
+    if is_windows()
+        # on windows, sh returns posix-style paths that are not valid according to ispath
+        @test pathA == pathB
+    else
+        @test Base.samefile(pathA, pathB)
+    end
 end
 
-# Here we test that if we close a stream with pending writes, we don't lose the writes.
-str = ""
-for i=1:1000
-  str = "$str\n $(randstring(10))"
-end
-stdout, stdin, proc = readandwrite(`$catcmd -`)
-write(stdin, str)
-close(stdin)
-str2 = readstring(stdout)
-@test str2 == str
+let str = "", stdin, stdout, proc, str2, file
+    for i = 1:1000
+      str = "$str\n $(randstring(10))"
+    end
 
-# This test hangs if the end of run walk across uv streams calls shutdown on a stream that is shutting down.
-file = tempname()
-open(pipeline(`$catcmd -`, file), "w") do io
-    write(io, str)
+    # Here we test that if we close a stream with pending writes, we don't lose the writes.
+    stdout, stdin, proc = readandwrite(`$catcmd -`)
+    write(stdin, str)
+    close(stdin)
+    str2 = readstring(stdout)
+    @test str2 == str
+
+    # This test hangs if the end-of-run-walk-across-uv-streams calls shutdown on a stream that is shutting down.
+    file = tempname()
+    open(pipeline(`$catcmd -`, file), "w") do io
+        write(io, str)
+    end
+    rm(file)
 end
-rm(file)
 
 # issue #3373
 # fixing up Conditions after interruptions
-r = Channel(1)
-t = @async begin
-    try
-        wait(r)
+let r, t
+    r = Channel(1)
+    t = @async begin
+        try
+            wait(r)
+        end
+        p = spawn(`$sleepcmd 1`); wait(p)
+        @test p.exitcode == 0
+        return true
     end
-    p = spawn(`$sleepcmd 1`); wait(p)
-    @test p.exitcode == 0
+    yield()
+    schedule(t, InterruptException(), error=true)
+    yield()
+    put!(r,11)
+    yield()
+    @test wait(t)
 end
-yield()
-schedule(t, InterruptException(), error=true)
-yield()
-put!(r,11)
-yield()
 
-# Test marking of AsyncStream
-
-r = Channel(1)
-@async begin
-    port, server = listenany(2327)
-    put!(r, port)
-    client = accept(server)
-    write(client, "Hello, world!\n")
-    write(client, "Goodbye, world...\n")
-    close(server)
+# Test marking of IO
+let r, t, sock
+    r = Channel(1)
+    t = @async begin
+        port, server = listenany(2327)
+        put!(r, port)
+        client = accept(server)
+        write(client, "Hello, world!\n")
+        write(client, "Goodbye, world...\n")
+        close(server)
+        return true
+    end
+    sock = connect(fetch(r))
+    mark(sock)
+    @test ismarked(sock)
+    @test readline(sock) == "Hello, world!"
+    @test readline(sock) == "Goodbye, world..."
+    @test reset(sock) == 0
+    @test !ismarked(sock)
+    mark(sock)
+    @test ismarked(sock)
+    @test readline(sock) == "Hello, world!"
+    unmark(sock)
+    @test !ismarked(sock)
+    @test_throws ArgumentError reset(sock)
+    @test !unmark(sock)
+    @test readline(sock) == "Goodbye, world..."
+    #@test eof(sock) ## doesn't work
+    close(sock)
+    @test wait(t)
 end
-sock = connect(fetch(r))
-mark(sock)
-@test ismarked(sock)
-@test readline(sock) == "Hello, world!\n"
-@test readline(sock) == "Goodbye, world...\n"
-@test reset(sock) == 0
-@test !ismarked(sock)
-mark(sock)
-@test ismarked(sock)
-@test readline(sock) == "Hello, world!\n"
-unmark(sock)
-@test !ismarked(sock)
-@test_throws ArgumentError reset(sock)
-@test !unmark(sock)
-@test readline(sock) == "Goodbye, world...\n"
-#@test eof(sock) ## doesn't work
-close(sock)
-
 # issue #4535
 exename = Base.julia_cmd()
 if valgrind_off
@@ -197,30 +214,25 @@ if valgrind_off
 end
 
 # issue #6310
-@test readstring(pipeline(`$echo "2+2"`, `$exename --startup-file=no`)) == "4\n"
+@test readstring(pipeline(`$echocmd "2+2"`, `$exename --startup-file=no`)) == "4\n"
 
 # issue #5904
 @test run(pipeline(ignorestatus(falsecmd), truecmd)) === nothing
 
+@testset "redirect_*" begin
+    let OLD_STDOUT = STDOUT,
+        fname = tempname(),
+        f = open(fname,"w")
 
-# issue #6010
-# TODO: should create separate set of task tests
-ducer = @async for i=1:100; produce(i); end
-yield()
-@test consume(ducer) == 1
-@test consume(ducer) == 2
-
-# redirect_*
-OLD_STDOUT = STDOUT
-fname = tempname()
-f = open(fname,"w")
-redirect_stdout(f)
-println("Hello World")
-redirect_stdout(OLD_STDOUT)
-close(f)
-@test "Hello World\n" == readstring(fname)
-@test is(OLD_STDOUT,STDOUT)
-rm(fname)
+        redirect_stdout(f)
+        println("Hello World")
+        redirect_stdout(OLD_STDOUT)
+        close(f)
+        @test "Hello World\n" == readstring(fname)
+        @test OLD_STDOUT === STDOUT
+        rm(fname)
+    end
+end
 
 # Test that redirecting an IOStream does not crash the process
 let fname = tempname()
@@ -260,15 +272,15 @@ end
 # issue #10994: libuv can't handle strings containing NUL
 let bad = "bad\0name"
     @test_throws ArgumentError run(`$bad`)
-    @test_throws ArgumentError run(`$echo $bad`)
-    @test_throws ArgumentError run(setenv(`$echo hello`, bad=>"good"))
-    @test_throws ArgumentError run(setenv(`$echo hello`, "good"=>bad))
+    @test_throws ArgumentError run(`$echocmd $bad`)
+    @test_throws ArgumentError run(setenv(`$echocmd hello`, bad=>"good"))
+    @test_throws ArgumentError run(setenv(`$echocmd hello`, "good"=>bad))
 end
 
 # issue #12829
-let out = Pipe(), echo = `$exename --startup-file=no -e 'print(STDOUT, " 1\t", readstring(STDIN))'`, ready = Condition()
+let out = Pipe(), echo = `$exename --startup-file=no -e 'print(STDOUT, " 1\t", readstring(STDIN))'`, ready = Condition(), t, infd, outfd
     @test_throws ArgumentError write(out, "not open error")
-    @async begin # spawn writer task
+    t = @async begin # spawn writer task
         open(echo, "w", out) do in1
             open(echo, "w", out) do in2
                 notify(ready)
@@ -278,15 +290,25 @@ let out = Pipe(), echo = `$exename --startup-file=no -e 'print(STDOUT, " 1\t", r
                 write(in2, "orld\n")
             end
         end
+        infd = Base._fd(out.in)
+        outfd = Base._fd(out.out)
         show(out, out)
         notify(ready)
         @test isreadable(out)
         @test iswritable(out)
         close(out.in)
+        @test !isopen(out.in)
+        is_windows() || @test !isopen(out.out) # it takes longer to propagate EOF through the Windows event system
         @test_throws ArgumentError write(out, "now closed error")
         @test isreadable(out)
         @test !iswritable(out)
-        @test isopen(out)
+        if is_windows()
+            # WINNT kernel does not provide a fast mechanism for async propagation
+            # of EOF for a blocking stream, so just wait for it to catch up.
+            # This shouldn't take much more than 32ms.
+            Base.wait_close(out)
+        end
+        @test !isopen(out)
     end
     wait(ready) # wait for writer task to be ready before using `out`
     @test nb_available(out) == 0
@@ -302,13 +324,16 @@ let out = Pipe(), echo = `$exename --startup-file=no -e 'print(STDOUT, " 1\t", r
     @test !isreadable(out)
     @test !iswritable(out)
     @test !isopen(out)
+    @test infd != Base._fd(out.in) == Base.INVALID_OS_HANDLE
+    @test outfd != Base._fd(out.out) == Base.INVALID_OS_HANDLE
     @test nb_available(out) == 0
     @test c == UInt8['w']
-    @test lstrip(ln2) == "1\thello\n"
-    @test ln1 == "orld\n"
+    @test lstrip(ln2) == "1\thello"
+    @test ln1 == "orld"
     @test isempty(read(out))
     @test eof(out)
-    @test desc == "Pipe(open => active, 0 bytes waiting)"
+    @test desc == "Pipe($infd open => $outfd active, 0 bytes waiting)"
+    wait(t)
 end
 
 # issue #8529
@@ -326,7 +351,7 @@ let fname = tempname()
         run(cmd)
     end
     """
-    @test success(pipeline(`$catcmd $fname`, `$exename -e $code`))
+    @test success(pipeline(`$catcmd $fname`, `$exename --startup-file=no -e $code`))
     rm(fname)
 end
 
@@ -368,19 +393,76 @@ end
 # equality tests for Cmd
 @test Base.Cmd(``) == Base.Cmd(``)
 @test Base.Cmd(`lsof -i :9090`) == Base.Cmd(`lsof -i :9090`)
-@test Base.Cmd(`$echo test`) == Base.Cmd(`$echo test`)
-@test Base.Cmd(``) != Base.Cmd(`$echo test`)
+@test Base.Cmd(`$echocmd test`) == Base.Cmd(`$echocmd test`)
+@test Base.Cmd(``) != Base.Cmd(`$echocmd test`)
 @test Base.Cmd(``, ignorestatus=true) != Base.Cmd(``, ignorestatus=false)
 @test Base.Cmd(``, dir="TESTS") != Base.Cmd(``, dir="TEST")
 @test Base.Set([``, ``]) == Base.Set([``])
-@test Set([``, echo]) != Set([``, ``])
-@test Set([echo, ``, ``, echo]) == Set([echo, ``])
+@test Set([``, echocmd]) != Set([``, ``])
+@test Set([echocmd, ``, ``, echocmd]) == Set([echocmd, ``])
 
 # equality tests for AndCmds
-@test Base.AndCmds(`$echo abc`, `$echo def`) == Base.AndCmds(`$echo abc`, `$echo def`)
-@test Base.AndCmds(`$echo abc`, `$echo def`) != Base.AndCmds(`$echo abc`, `$echo xyz`)
+@test Base.AndCmds(`$echocmd abc`, `$echocmd def`) == Base.AndCmds(`$echocmd abc`, `$echocmd def`)
+@test Base.AndCmds(`$echocmd abc`, `$echocmd def`) != Base.AndCmds(`$echocmd abc`, `$echocmd xyz`)
+
+# test for correct error when an empty command is spawned (Issue 19094)
+@test_throws ArgumentError run(Base.Cmd(``))
+@test_throws ArgumentError run(Base.AndCmds(``, ``))
+@test_throws ArgumentError run(Base.AndCmds(``, `$truecmd`))
+@test_throws ArgumentError run(Base.AndCmds(`$truecmd`, ``))
+
+@test_throws ArgumentError spawn(Base.Cmd(``))
+@test_throws ArgumentError spawn(Base.AndCmds(``, ``))
+@test_throws ArgumentError spawn(Base.AndCmds(``, `$echocmd test`))
+@test_throws ArgumentError spawn(Base.AndCmds(`$echocmd test`, ``))
 
 # tests for reducing over collection of Cmd
 @test_throws ArgumentError reduce(&, Base.AbstractCmd[])
 @test_throws ArgumentError reduce(&, Base.Cmd[])
-@test reduce(&, [`$echo abc`, `$echo def`, `$echo hij`]) == `$echo abc` & `$echo def` & `$echo hij`
+@test reduce(&, [`$echocmd abc`, `$echocmd def`, `$echocmd hij`]) == `$echocmd abc` & `$echocmd def` & `$echocmd hij`
+
+# test for proper handling of FD exhaustion
+if is_unix()
+    let ps = Pipe[]
+        ulimit_n = tryparse(Int, readchomp(`sh -c 'ulimit -n'`))
+        try
+            for i = 1 : 100 * get(ulimit_n, 1000)
+                p = Pipe()
+                Base.link_pipe(p)
+                push!(ps, p)
+            end
+            if isnull(ulimit_n)
+                warn("`ulimit -n` is set to unlimited, fd exhaustion cannot be tested")
+                @test_broken false
+            else
+                @test false
+            end
+        catch ex
+            isa(ex, Base.UVError) || rethrow(ex)
+            @test ex.code == Base.UV_EMFILE
+        finally
+            for p in ps
+                close(p)
+            end
+        end
+    end
+end
+
+# Test for PR 17803
+let p=Pipe()
+    Base.link_pipe(p; julia_only_read=true, julia_only_write=true)
+    ccall(:jl_static_show, Void, (Ptr{Void}, Any), p.in, Int128(-1))
+    @async close(p.in)
+    @test readstring(p.out) == "Int128(0xffffffffffffffffffffffffffffffff)"
+end
+
+# readlines(::Cmd), accidentally broken in #20203
+@test sort(readlines(`$lscmd -A`)) == sort(readdir())
+
+# issue #19864 (PR #20497)
+@test readchomp(pipeline(ignorestatus(
+        `$exename --startup-file=no -e '
+            struct Error19864 <: Exception; end
+            Base.showerror(io::IO, e::Error19864) = print(io, "correct19864")
+            throw(Error19864())'`),
+    stderr=catcmd)) == "ERROR: correct19864"

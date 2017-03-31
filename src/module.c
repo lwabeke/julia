@@ -11,10 +11,11 @@
 extern "C" {
 #endif
 
-jl_module_t *jl_main_module=NULL;
-jl_module_t *jl_core_module=NULL;
-jl_module_t *jl_base_module=NULL;
-jl_module_t *jl_top_module=NULL;
+jl_module_t *jl_main_module = NULL;
+jl_module_t *jl_core_module = NULL;
+jl_module_t *jl_base_module = NULL;
+jl_module_t *jl_top_module = NULL;
+extern jl_function_t *jl_append_any_func;
 
 JL_DLLEXPORT jl_module_t *jl_new_module(jl_sym_t *name)
 {
@@ -26,7 +27,9 @@ JL_DLLEXPORT jl_module_t *jl_new_module(jl_sym_t *name)
     m->name = name;
     m->parent = NULL;
     m->istopmod = 0;
-    m->uuid = uv_now(uv_default_loop());
+    static unsigned int mcounter; // simple counter backup, in case hrtime is not incrementing
+    m->uuid = jl_hrtime() + (++mcounter);
+    if (!m->uuid) m->uuid++; // uuid 0 is invalid
     m->counter = 0;
     htable_new(&m->bindings, 0);
     arraylist_new(&m->usings, 0);
@@ -60,8 +63,10 @@ JL_DLLEXPORT void jl_set_istopmod(uint8_t isprimary)
 {
     jl_ptls_t ptls = jl_get_ptls_states();
     ptls->current_module->istopmod = 1;
-    if (isprimary)
+    if (isprimary) {
         jl_top_module = ptls->current_module;
+        jl_append_any_func = NULL;
+    }
 }
 
 JL_DLLEXPORT uint8_t jl_istopmod(jl_module_t *mod)
@@ -195,8 +200,10 @@ static jl_binding_t *jl_get_binding_(jl_module_t *m, jl_sym_t *var, modstack_t *
                     (void)jl_get_binding_wr(m, var);
                     return NULL;
                 }
-                owner = imp;
-                b = tempb;
+                if (owner == NULL || !tempb->deprecated) {
+                    owner = imp;
+                    b = tempb;
+                }
             }
         }
         if (owner != NULL) {
@@ -254,9 +261,8 @@ static int eq_bindings(jl_binding_t *a, jl_binding_t *b)
 // does module m explicitly import s?
 JL_DLLEXPORT int jl_is_imported(jl_module_t *m, jl_sym_t *s)
 {
-    jl_binding_t **bp = (jl_binding_t**)ptrhash_bp(&m->bindings, s);
-    jl_binding_t *bto = *bp;
-    return (bto != HT_NOTFOUND && bto->imported);
+    jl_binding_t *b = (jl_binding_t*)ptrhash_get(&m->bindings, s);
+    return (b != HT_NOTFOUND && b->imported);
 }
 
 // NOTE: we use explici since explicit is a C++ keyword
@@ -404,23 +410,20 @@ JL_DLLEXPORT int jl_boundp(jl_module_t *m, jl_sym_t *var)
 
 JL_DLLEXPORT int jl_defines_or_exports_p(jl_module_t *m, jl_sym_t *var)
 {
-    jl_binding_t **bp = (jl_binding_t**)ptrhash_bp(&m->bindings, var);
-    if (*bp == HT_NOTFOUND) return 0;
-    return (*bp)->exportp || (*bp)->owner==m;
+    jl_binding_t *b = (jl_binding_t*)ptrhash_get(&m->bindings, var);
+    return b != HT_NOTFOUND && (b->exportp || b->owner==m);
 }
 
 JL_DLLEXPORT int jl_module_exports_p(jl_module_t *m, jl_sym_t *var)
 {
-    jl_binding_t **bp = (jl_binding_t**)ptrhash_bp(&m->bindings, var);
-    if (*bp == HT_NOTFOUND) return 0;
-    return (*bp)->exportp;
+    jl_binding_t *b = (jl_binding_t*)ptrhash_get(&m->bindings, var);
+    return b != HT_NOTFOUND && b->exportp;
 }
 
 JL_DLLEXPORT int jl_binding_resolved_p(jl_module_t *m, jl_sym_t *var)
 {
-    jl_binding_t **bp = (jl_binding_t**)ptrhash_bp(&m->bindings, var);
-    if (*bp == HT_NOTFOUND) return 0;
-    return (*bp)->owner != NULL;
+    jl_binding_t *b = (jl_binding_t*)ptrhash_get(&m->bindings, var);
+    return b != HT_NOTFOUND && b->owner != NULL;
 }
 
 JL_DLLEXPORT jl_value_t *jl_get_global(jl_module_t *m, jl_sym_t *var)
@@ -484,7 +487,7 @@ void jl_binding_deprecation_warning(jl_binding_t *b)
         else
             jl_printf(JL_STDERR, "%s is deprecated", jl_symbol_name(b->name));
         jl_value_t *v = b->value;
-        if (v && (jl_is_type(v)/* || (jl_is_function(v) && jl_is_gf(v))*/)) {
+        if (v && (jl_is_type(v) || jl_is_module(v)/* || (jl_is_function(v) && jl_is_gf(v))*/)) {
             jl_printf(JL_STDERR, ", use ");
             jl_static_show(JL_STDERR, v);
             jl_printf(JL_STDERR, " instead");
@@ -563,12 +566,14 @@ JL_DLLEXPORT jl_value_t *jl_module_names(jl_module_t *m, int all, int imported)
     JL_GC_PUSH1(&a);
     size_t i;
     void **table = m->bindings.table;
-    for(i=1; i < m->bindings.size; i+=2) {
+    for (i = 1; i < m->bindings.size; i+=2) {
         if (table[i] != HT_NOTFOUND) {
             jl_binding_t *b = (jl_binding_t*)table[i];
             int hidden = jl_symbol_name(b->name)[0]=='#';
-            if ((b->exportp || ((imported || b->owner == m) && (all || m == jl_main_module))) &&
-                !b->deprecated && !hidden) {
+            if ((b->exportp ||
+                 (imported && b->imported) ||
+                 ((b->owner == m) && (all || m == jl_main_module))) &&
+                (all || (!b->deprecated && !hidden))) {
                 jl_array_grow_end(a, 1);
                 //XXX: change to jl_arrayset if array storage allocation for Array{Symbols,1} changes:
                 jl_array_ptr_set(a, jl_array_dim0(a)-1, (jl_value_t*)b->name);

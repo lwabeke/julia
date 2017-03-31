@@ -1,17 +1,17 @@
 # This file is a part of Julia. License is MIT: http://julialang.org/license
 
-type Table
+mutable struct Table
     rows::Vector{Vector{Any}}
     align::Vector{Symbol}
 end
 
 function parserow(stream::IO)
     withstream(stream) do
-        line = readline(stream) |> chomp
-        row = split(line, "|")
+        line = readline(stream)
+        row = split(line, r"(?<!\\)\|")
         length(row) == 1 && return
         row[1] == "" && shift!(row)
-        map!(strip, row)
+        map!(x -> strip(replace(x, "\\|", "|")), row, row)
         row[end] == "" && pop!(row)
         return row
     end
@@ -78,7 +78,7 @@ end
 mapmap(f, xss) = map(xs->map(f, xs), xss)
 
 colwidths(rows; len = length, min = 0) =
-    reduce(max, [min; convert(Vector{Vector{Int}}, mapmap(len, rows))])
+    reduce((x,y) -> max.(x,y), [min; convert(Vector{Vector{Int}}, mapmap(len, rows))])
 
 padding(width, twidth, a) =
     a == :l ? (0, twidth - width) :
@@ -103,7 +103,9 @@ _dash(width, align) =
     throw(ArgumentError("Invalid alignment $align"))
 
 function plain(io::IO, md::Table)
-    cells = mapmap(plaininline, md.rows)
+    cells = mapmap(md.rows) do each
+        replace(plaininline(each), "|", "\\|")
+    end
     padcells!(cells, md.align, len = length, min = 3)
     for i = indices(cells,1)
         print(io, "| ")

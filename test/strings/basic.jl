@@ -1,11 +1,13 @@
 # This file is a part of Julia. License is MIT: http://julialang.org/license
 
 # constructors
-let d = [0x61,0x62,0x63,0x21]
-    @test String(d) == "abc!"
-    @test String(d).data === d # String(d) should not make a copy
-end
+@test String([0x61,0x62,0x63,0x21]) == "abc!"
 @test String("abc!") == "abc!"
+
+@test isempty(string())
+@test eltype(GenericString) == Char
+@test start("abc") == 1
+@test cmp("ab","abc") == -1
 
 # {starts,ends}with
 @test startswith("abcd", 'a')
@@ -50,6 +52,7 @@ let
     # make symbol with invalid char
     sym = Symbol(Char(0xdcdb))
     @test string(sym) == string(Char(0xdcdb))
+    @test String(sym) == string(Char(0xdcdb))
     @test expand(sym) === sym
     res = string(parse(string(Char(0xdcdb)," = 1"),1,raise=false)[1])
     @test res == """\$(Expr(:error, "invalid character \\\"\\udcdb\\\"\"))"""
@@ -69,9 +72,9 @@ end
 let f =IOBuffer(),
     x = split("1 2 3")
     @test write(f, x) == 3
-    @test takebuf_string(f) == "123"
+    @test String(take!(f)) == "123"
     @test invoke(write, Tuple{IO, AbstractArray}, f, x) == 3
-    @test takebuf_string(f) == "123"
+    @test String(take!(f)) == "123"
 end
 
 # issue #7248
@@ -155,23 +158,23 @@ end
 @test lcfirst("*")=="*"
 
 # test AbstractString functions at beginning of string.jl
-immutable tstStringType <: AbstractString
+struct tstStringType <: AbstractString
     data::Array{UInt8,1}
 end
-tstr = tstStringType("12");
+tstr = tstStringType("12")
 @test_throws ErrorException endof(tstr)
 @test_throws ErrorException next(tstr, Bool(1))
 
-gstr = GenericString("12");
+gstr = GenericString("12")
 @test typeof(string(gstr))==GenericString
 
 @test convert(Array{UInt8}, gstr) ==[49;50]
 @test convert(Array{Char,1}, gstr) ==['1';'2']
 @test convert(Symbol, gstr)==Symbol("12")
 
-@test getindex(gstr, Bool(1))=='1'
-@test getindex(gstr,Bool(1):Bool(1))=="1"
-@test getindex(gstr,AbstractVector([Bool(1):Bool(1);]))=="1"
+@test gstr[1] == '1'
+@test gstr[1:1] == "1"
+@test gstr[[1]] == "1"
 
 @test done(eachindex("foobar"),7)
 @test eltype(Base.EachStringIndex) == Int
@@ -184,9 +187,8 @@ gstr = GenericString("12");
 
 @test length(GenericString(""))==0
 
-@test getindex(gstr,AbstractVector([Bool(1):Bool(1);]))=="1"
-
-@test nextind(AbstractArray([Bool(1):Bool(1);]),1)==2
+@test nextind(1:1, 1) == 2
+@test nextind([1], 1) == 2
 
 @test ind2chr(gstr,2)==2
 
@@ -242,7 +244,7 @@ end
 
 cstrdup(s) = @static is_windows() ? ccall(:_strdup, Cstring, (Cstring,), s) : ccall(:strdup, Cstring, (Cstring,), s)
 let p = cstrdup("hello")
-    @test unsafe_string(p) == "hello" == unsafe_wrap(String, cstrdup(p), true)
+    @test unsafe_string(p) == "hello"
     Libc.free(p)
 end
 
@@ -287,11 +289,11 @@ for (val, pass) in (
         (b"\udc00\u0100", false),
         (b"\udc00\ud800", false)
         )
-    @test isvalid(String, val) == pass
+    @test isvalid(String, val) == pass == isvalid(String(val))
 end
 
 # Issue #11203
-@test isvalid(String, UInt8[]) == true
+@test isvalid(String, UInt8[]) == true == isvalid("")
 
 # Check UTF-8 characters
 # Check ASCII range (true),
@@ -386,6 +388,12 @@ end
 @test lcfirst(GenericString("a")) == "a"
 @test ucfirst(GenericString("A")) == "A"
 
+# titlecase
+@test titlecase('ǉ') == 'ǈ'
+@test titlecase("ǉubljana") == "ǈubljana"
+@test titlecase("aBc ABC") == "ABc ABC"
+@test titlecase("abcD   EFG\n\thij") == "AbcD   EFG\n\tHij"
+
 # issue # 11464: uppercase/lowercase of GenericString becomes a String
 str = "abcdef\uff\uffff\u10ffffABCDEF"
 @test typeof(uppercase("abcdef")) == String
@@ -404,6 +412,10 @@ foobaz(ch) = reinterpret(Char, typemax(UInt32))
 @test ["b","c"].*"a" == ["ba","ca"]
 @test ["a","b"].*["c" "d"] == ["ac" "ad"; "bc" "bd"]
 
+@test one(String) == ""
+@test prod(["*" for i in 1:3]) == "***"
+@test prod(["*" for i in 1:0]) == ""
+
 # Make sure NULL pointers are handled consistently by String
 @test_throws ArgumentError unsafe_string(Ptr{UInt8}(0))
 @test_throws ArgumentError unsafe_string(Ptr{UInt8}(0), 10)
@@ -419,3 +431,36 @@ foobaz(ch) = reinterpret(Char, typemax(UInt32))
 # issue #17271: endof() doesn't throw an error even with invalid strings
 @test endof(String(b"\x90")) == 0
 @test endof(String(b"\xce")) == 1
+
+# issue #17624, missing getindex method for String
+@test "abc"[:] == "abc"
+
+# issue #18280: next/nextind must return past String's underlying data
+for s in ("Hello", "Σ", "こんにちは", "😊😁")
+    @test next(s, endof(s))[2] > sizeof(s)
+    @test nextind(s, endof(s)) > sizeof(s)
+end
+
+# Test cmp with AbstractStrings that don't index the same as UTF-8, which would include
+# (LegacyString.)UTF16String and (LegacyString.)UTF32String, among others.
+
+mutable struct CharStr <: AbstractString
+    chars::Vector{Char}
+    CharStr(x) = new(collect(x))
+end
+Base.start(x::CharStr) = start(x.chars)
+Base.next(x::CharStr, i::Int) = next(x.chars, i)
+Base.done(x::CharStr, i::Int) = done(x.chars, i)
+Base.endof(x::CharStr) = endof(x.chars)
+
+# Simple case, with just ANSI Latin 1 characters
+@test "áB" != CharStr("áá") # returns false with bug
+@test cmp("áB", CharStr("áá")) == -1 # returns 0 with bug
+
+# Case with Unicode characters
+@test cmp("\U1f596\U1f596", CharStr("\U1f596")) == 1   # Gives BoundsError with bug
+@test cmp(CharStr("\U1f596"), "\U1f596\U1f596") == -1
+
+# issue #12495: check that logical indexing attempt raises ArgumentError
+@test_throws ArgumentError "abc"[[true, false, true]]
+@test_throws ArgumentError "abc"[BitArray([true, false, true])]

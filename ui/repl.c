@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <math.h>
 #include <ctype.h>
+#include <inttypes.h>
 
 #include "uv.h"
 #define WHOLE_ARCHIVE
@@ -44,30 +45,41 @@ __attribute__((constructor)) void jl_register_ptls_states_getter(void)
 static int exec_program(char *program)
 {
     jl_ptls_t ptls = jl_get_ptls_states();
-    int err = 0;
-  again: ;
     JL_TRY {
-        if (err) {
-            jl_value_t *errs = jl_stderr_obj();
-            jl_value_t *e = ptls->exception_in_transit;
-            if (errs != NULL) {
-                jl_show(errs, e);
-            }
-            else {
-                jl_printf(JL_STDERR, "error during bootstrap:\n");
-                jl_static_show(JL_STDERR, e);
-                jl_printf(JL_STDERR, "\n");
-                jlbacktrace();
-            }
-            jl_printf(JL_STDERR, "\n");
-            JL_EH_POP();
-            return 1;
-        }
         jl_load(program);
     }
     JL_CATCH {
-        err = 1;
-        goto again;
+        jl_value_t *errs = jl_stderr_obj();
+        jl_value_t *e = ptls->exception_in_transit;
+        // Manually save and restore the backtrace so that we print the original
+        // one instead of the one caused by `jl_show`.
+        // We can't use safe_restore since that will cause any error
+        // (including the ones that would have been caught) to abort.
+        uintptr_t *volatile bt_data = NULL;
+        size_t bt_size = ptls->bt_size;
+        JL_TRY {
+            if (errs) {
+                bt_data = (uintptr_t*)malloc(bt_size * sizeof(void*));
+                memcpy(bt_data, ptls->bt_data, bt_size * sizeof(void*));
+                jl_show(errs, e);
+                jl_printf(JL_STDERR, "\n");
+                free(bt_data);
+            }
+        }
+        JL_CATCH {
+            ptls->bt_size = bt_size;
+            memcpy(ptls->bt_data, bt_data, bt_size * sizeof(void*));
+            free(bt_data);
+            errs = NULL;
+        }
+        if (!errs) {
+            jl_printf(JL_STDERR, "error during bootstrap:\n");
+            jl_static_show(JL_STDERR, e);
+            jl_printf(JL_STDERR, "\n");
+            jlbacktrace();
+            jl_printf(JL_STDERR, "\n");
+        }
+        return 1;
     }
     return 0;
 }
@@ -109,7 +121,15 @@ static NOINLINE int true_main(int argc, char *argv[])
         (jl_function_t*)jl_get_global(jl_base_module, jl_symbol("_start")) : NULL;
 
     if (start_client) {
-        jl_apply(&start_client, 1);
+        JL_TRY {
+            size_t last_age = jl_get_ptls_states()->world_age;
+            jl_get_ptls_states()->world_age = jl_get_world_counter();
+            jl_apply(&start_client, 1);
+            jl_get_ptls_states()->world_age = last_age;
+        }
+        JL_CATCH {
+            jl_no_exc_handler(jl_exception_in_transit);
+        }
         return 0;
     }
 
@@ -157,6 +177,8 @@ static NOINLINE int true_main(int argc, char *argv[])
     }
     return 0;
 }
+
+extern JL_DLLEXPORT uint64_t jl_cpuid_tag();
 
 #ifndef _OS_WINDOWS_
 int main(int argc, char *argv[])
@@ -222,13 +244,23 @@ int wmain(int argc, wchar_t *argv[], wchar_t *envp[])
         argv[i] = (wchar_t*)arg;
     }
 #endif
-    libsupport_init();
-    if (argc >= 2 && strcmp((char*)argv[1],"--lisp") == 0) {
-        jl_lisp_prompt();
+    if (argc >= 2 && strcmp((char *)argv[1], "--cpuid") == 0) {
+        /* Used by the build system to name CPUID-specific binaries */
+        printf("%" PRIx64, jl_cpuid_tag());
         return 0;
+    }
+    libsupport_init();
+    int lisp_prompt = (argc >= 2 && strcmp((char*)argv[1],"--lisp") == 0);
+    if (lisp_prompt) {
+        memmove(&argv[1], &argv[2], (argc-2)*sizeof(void*));
+        argc--;
     }
     jl_parse_opts(&argc, (char***)&argv);
     julia_init(jl_options.image_file_specified ? JL_IMAGE_CWD : JL_IMAGE_JULIA_HOME);
+    if (lisp_prompt) {
+        jl_lisp_prompt();
+        return 0;
+    }
     int ret = true_main(argc, (char**)argv);
     jl_atexit_hook(ret);
     return ret;

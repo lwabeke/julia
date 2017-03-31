@@ -2,11 +2,12 @@
 
 using Base.REPLCompletions
 
-module CompletionFoo
-    type Test_y
+ex = quote
+    module CompletionFoo
+    mutable struct Test_y
         yy
     end
-    type Test_x
+    mutable struct Test_x
         xx :: Test_y
     end
     type_test = Test_x(Test_y(1))
@@ -19,6 +20,14 @@ module CompletionFoo
     macro foobar()
         :()
     end
+
+    # Support non-Dict Associatives, #19441
+    mutable struct CustomDict{K, V} <: Associative{K, V}
+        mydict::Dict{K, V}
+    end
+
+    Base.keys(d::CustomDict) = collect(keys(d.mydict))
+    Base.length(d::CustomDict) = length(d.mydict)
 
     test{T<:Real}(x::T, y::T) = pass
     test(x::Real, y::Real) = pass
@@ -51,18 +60,31 @@ module CompletionFoo
     const tuple = (1, 2)
 
     test_y_array=[CompletionFoo.Test_y(rand()) for i in 1:10]
+    test_dict = Dict("abc"=>1, "abcd"=>10, :bar=>2, :bar2=>9, Base=>3,
+                     contains=>4, `ls`=>5, 66=>7, 67=>8, ("q",3)=>11,
+                     "α"=>12, :α=>13)
+    test_customdict = CustomDict(test_dict)
+    end
+    test_repl_comp_dict = CompletionFoo.test_dict
+    test_repl_comp_customdict = CompletionFoo.test_customdict
 end
+ex.head = :toplevel
+eval(Main, ex)
 
-function temp_pkg_dir(fn::Function)
-    # Used in tests below to setup and teardown a sandboxed package directory
-    const tmpdir = ENV["JULIA_PKGDIR"] = joinpath(tempdir(),randstring())
-    @test !isdir(Pkg.dir())
-    try
-        mkpath(Pkg.dir())
-        @test isdir(Pkg.dir())
-        fn()
-    finally
-        rm(tmpdir, recursive=true)
+function temp_pkg_dir_noinit(fn::Function)
+    # Used in tests below to set up and tear down a sandboxed package directory
+    # Unlike the version in test/pkg.jl, this does not run Pkg.init so does not
+    # clone METADATA (only pkg and libgit2-online tests should need internet access)
+    const tmpdir = joinpath(tempdir(),randstring())
+    withenv("JULIA_PKGDIR" => tmpdir) do
+        @test !isdir(Pkg.dir())
+        try
+            mkpath(Pkg.dir())
+            @test isdir(Pkg.dir())
+            fn()
+        finally
+            rm(tmpdir, recursive=true)
+        end
     end
 end
 
@@ -218,7 +240,7 @@ end
 s = "CompletionFoo.test(1,1, "
 c, r, res = test_complete(s)
 @test !res
-@test c[1] == string(first(methods(CompletionFoo.test, Tuple{Int, Int})))
+@test c[1] == string(first(methods(Main.CompletionFoo.test, Tuple{Int, Int})))
 @test length(c) == 3
 @test r == 1:18
 @test s[r] == "CompletionFoo.test"
@@ -226,7 +248,7 @@ c, r, res = test_complete(s)
 s = "CompletionFoo.test(CompletionFoo.array,"
 c, r, res = test_complete(s)
 @test !res
-@test c[1] == string(first(methods(CompletionFoo.test, Tuple{Array{Int, 1}, Any})))
+@test c[1] == string(first(methods(Main.CompletionFoo.test, Tuple{Array{Int, 1}, Any})))
 @test length(c) == 2
 @test r == 1:18
 @test s[r] == "CompletionFoo.test"
@@ -234,7 +256,7 @@ c, r, res = test_complete(s)
 s = "CompletionFoo.test(1,1,1,"
 c, r, res = test_complete(s)
 @test !res
-@test c[1] == string(first(methods(CompletionFoo.test, Tuple{Any, Any, Any})))
+@test c[1] == string(first(methods(Main.CompletionFoo.test, Tuple{Any, Any, Any})))
 @test r == 1:18
 @test s[r] == "CompletionFoo.test"
 
@@ -262,26 +284,26 @@ for (T, arg) in [(String,"\")\""),(Char, "')'")]
     s = "(1, CompletionFoo.test2($arg,"
     c, r, res = test_complete(s)
     @test length(c) == 1
-    @test c[1] == string(first(methods(CompletionFoo.test2, Tuple{T,})))
+    @test c[1] == string(first(methods(Main.CompletionFoo.test2, Tuple{T,})))
     @test r == 5:23
     @test s[r] == "CompletionFoo.test2"
 end
 
-s = "(1, CompletionFoo.test2(`)`,"
+s = "(1, CompletionFoo.test2(`')'`,"
 c, r, res = test_complete(s)
-@test c[1] == string(first(methods(CompletionFoo.test2, Tuple{Cmd})))
+@test c[1] == string(first(methods(Main.CompletionFoo.test2, Tuple{Cmd})))
 @test length(c) == 1
 
 s = "CompletionFoo.test3([1, 2] + CompletionFoo.varfloat,"
 c, r, res = test_complete(s)
 @test !res
-@test c[1] == string(first(methods(CompletionFoo.test3, Tuple{Array{Float64, 1}, Float64})))
+@test c[1] == string(first(methods(Main.CompletionFoo.test3, Tuple{Array{Float64, 1}, Float64})))
 @test length(c) == 1
 
 s = "CompletionFoo.test3([1.,2.], 1.,"
 c, r, res = test_complete(s)
 @test !res
-@test c[1] == string(first(methods(CompletionFoo.test3, Tuple{Array{Float64, 1}, Float64})))
+@test c[1] == string(first(methods(Main.CompletionFoo.test3, Tuple{Array{Float64, 1}, Float64})))
 @test r == 1:19
 @test length(c) == 1
 @test s[r] == "CompletionFoo.test3"
@@ -289,22 +311,25 @@ c, r, res = test_complete(s)
 s = "CompletionFoo.test4(\"e\",r\" \","
 c, r, res = test_complete(s)
 @test !res
-@test c[1] == string(first(methods(CompletionFoo.test4, Tuple{String, Regex})))
+@test c[1] == string(first(methods(Main.CompletionFoo.test4, Tuple{String, Regex})))
 @test r == 1:19
 @test length(c) == 1
 @test s[r] == "CompletionFoo.test4"
 
+# (As discussed in #19829, the Base.REPLCompletions.get_type function isn't
+#  powerful enough to analyze general dot calls because it can't handle
+#  anonymous-function evaluation.)
 s = "CompletionFoo.test5(push!(Base.split(\"\",' '),\"\",\"\").==\"\","
 c, r, res = test_complete(s)
 @test !res
-@test length(c) == 1
-@test c[1] == string(first(methods(CompletionFoo.test5, Tuple{BitArray{1}})))
+@test_broken length(c) == 1
+@test_broken c[1] == string(first(methods(Main.CompletionFoo.test5, Tuple{BitArray{1}})))
 
 s = "CompletionFoo.test4(CompletionFoo.test_y_array[1]()[1], CompletionFoo.test_y_array[1]()[2], "
 c, r, res = test_complete(s)
 @test !res
 @test length(c) == 1
-@test c[1] == string(first(methods(CompletionFoo.test4, Tuple{String, String})))
+@test c[1] == string(first(methods(Main.CompletionFoo.test4, Tuple{String, String})))
 
 # Test that string escaption is handled correct
 s = """CompletionFoo.test4("\\"","""
@@ -338,13 +363,13 @@ s = "\"\"."
 c,r = test_complete(s)
 @test length(c)==1
 @test r == (endof(s)+1):endof(s)
-@test c[1] == "data"
+@test c[1] == "len"
 
 s = "(\"\"*\"\")."
 c,r = test_complete(s)
 @test length(c)==1
 @test r == (endof(s)+1):endof(s)
-@test c[1] == "data"
+@test c[1] == "len"
 
 s = "CompletionFoo.test_y_array[1]."
 c,r = test_complete(s)
@@ -378,7 +403,7 @@ c, r, res = test_complete(s)
 
 # Test completion of packages
 mkp(p) = ((@assert !isdir(p)); mkpath(p))
-temp_pkg_dir() do
+temp_pkg_dir_noinit() do
     # Complete <Mod>/src/<Mod>.jl and <Mod>.jl/src/<Mod>.jl
     # but not <Mod>/ if no corresponding .jl file is found
     pkg_dir = Pkg.dir("CompletionFooPackage", "src")
@@ -663,59 +688,63 @@ c, r, res = test_complete(s)
 @test isempty(c)
 
 # test Dicts
-test_dict = Dict("abc"=>1, "abcd"=>10, :bar=>2, :bar2=>9, Base=>3, contains=>4, `ls`=>5,
-      66=>7, 67=>8, ("q",3)=>11, "α"=>12, :α=>13)
-s="test_dict[\"ab"
-c,r = test_complete(s)
-@test c == Any["\"abc\"","\"abcd\""]
-s="test_dict[\"abcd"
-c,r = test_complete(s)
-@test c == Any["\"abcd\"]"]
-s="test_dict[ \"abcd"  # leading whitespace
-c,r = test_complete(s)
-@test c == Any["\"abcd\"]"]
-s="test_dict[\"abcd]"  # trailing close bracket
-c,r = completions(s,endof(s)-1)
-@test c == Any["\"abcd\""]
-s="test_dict[:b"
-c,r = test_complete(s)
-@test c == Any[":bar",":bar2"]
-s="test_dict[:bar2"
-c,r = test_complete(s)
-@test c == Any[":bar2]"]
-s="test_dict[Ba"
-c,r = test_complete(s)
-@test c == Any["Base]"]
-s="test_dict[co"
-c,r = test_complete(s)
-@test c == Any["contains]"]
-s="test_dict[`l"
-c,r = test_complete(s)
-@test c == Any["`ls`]"]
-s="test_dict[6"
-c,r = test_complete(s)
-@test c == Any["66","67"]
-s="test_dict[66"
-c,r = test_complete(s)
-@test c == Any["66]"]
-s="test_dict[("
-c,r = test_complete(s)
-@test c == Any["(\"q\",3)]"]
-s="test_dict[\"\\alp"
-c,r = test_complete(s)
-@test c == String["\\alpha"]
-s="test_dict[\"\\alpha"
-c,r = test_complete(s)
-@test c == String["α"]
-s="test_dict[\"α"
-c,r = test_complete(s)
-@test c == Any["\"α\"]"]
-s="test_dict[:\\alp"
-c,r = test_complete(s)
-@test c == String["\\alpha"]
-s="test_dict[:\\alpha"
-c,r = test_complete(s)
-@test c == String["α"]
-s="test_dict[:α"
-c,r = test_complete(s)
-@test c == Any[":α]"]
+function test_dict_completion(dict_name)
+    s = "$dict_name[\"ab"
+    c, r = test_complete(s)
+    @test c == Any["\"abc\"", "\"abcd\""]
+    s = "$dict_name[\"abcd"
+    c, r = test_complete(s)
+    @test c == Any["\"abcd\"]"]
+    s = "$dict_name[ \"abcd"  # leading whitespace
+    c, r = test_complete(s)
+    @test c == Any["\"abcd\"]"]
+    s = "$dict_name[\"abcd]"  # trailing close bracket
+    c, r = completions(s, endof(s) - 1)
+    @test c == Any["\"abcd\""]
+    s = "$dict_name[:b"
+    c, r = test_complete(s)
+    @test c == Any[":bar", ":bar2"]
+    s = "$dict_name[:bar2"
+    c, r = test_complete(s)
+    @test c == Any[":bar2]"]
+    s = "$dict_name[Ba"
+    c, r = test_complete(s)
+    @test c == Any["Base]"]
+    s = "$dict_name[co"
+    c, r = test_complete(s)
+    @test c == Any["contains]"]
+    s = "$dict_name[`l"
+    c, r = test_complete(s)
+    @test c == Any["`ls`]"]
+    s = "$dict_name[6"
+    c, r = test_complete(s)
+    @test c == Any["66", "67"]
+    s = "$dict_name[66"
+    c, r = test_complete(s)
+    @test c == Any["66]"]
+    s = "$dict_name[("
+    c, r = test_complete(s)
+    @test c == Any["(\"q\", 3)]"]
+    s = "$dict_name[\"\\alp"
+    c, r = test_complete(s)
+    @test c == String["\\alpha"]
+    s = "$dict_name[\"\\alpha"
+    c, r = test_complete(s)
+    @test c == String["α"]
+    s = "$dict_name[\"α"
+    c, r = test_complete(s)
+    @test c == Any["\"α\"]"]
+    s = "$dict_name[:\\alp"
+    c, r = test_complete(s)
+    @test c == String["\\alpha"]
+    s = "$dict_name[:\\alpha"
+    c, r = test_complete(s)
+    @test c == String["α"]
+    s = "$dict_name[:α"
+    c, r = test_complete(s)
+    @test c == Any[":α]"]
+end
+test_dict_completion("CompletionFoo.test_dict")
+test_dict_completion("CompletionFoo.test_customdict")
+test_dict_completion("test_repl_comp_dict")
+test_dict_completion("test_repl_comp_customdict")

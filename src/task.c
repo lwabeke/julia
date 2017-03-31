@@ -147,7 +147,8 @@ static void NOINLINE save_stack(jl_ptls_t ptls, jl_task_t *t)
     if (t->state == done_sym || t->state == failed_sym)
         return;
     char *frame_addr = (char*)jl_get_frame_addr();
-    size_t nb = (char*)ptls->stackbase - frame_addr;
+    char *stackbase = (char*)ptls->stackbase;
+    size_t nb = stackbase > frame_addr ? stackbase - frame_addr : 0;
     char *buf;
     if (t->stkbuf == NULL || t->bufsz < nb) {
         buf = (char*)jl_gc_alloc_buf(ptls, nb);
@@ -188,6 +189,7 @@ static jl_function_t *task_done_hook_func=NULL;
 static void JL_NORETURN finish_task(jl_task_t *t, jl_value_t *resultval)
 {
     jl_ptls_t ptls = jl_get_ptls_states();
+    JL_SIGATOMIC_BEGIN();
     if (t->exception != jl_nothing)
         t->state = failed_sym;
     else
@@ -211,7 +213,12 @@ static void JL_NORETURN finish_task(jl_task_t *t, jl_value_t *resultval)
     }
     if (task_done_hook_func != NULL) {
         jl_value_t *args[2] = {task_done_hook_func, (jl_value_t*)t};
-        jl_apply(args, 2);
+        JL_TRY {
+            jl_apply(args, 2);
+        }
+        JL_CATCH {
+            jl_no_exc_handler(jl_exception_in_transit);
+        }
     }
     gc_debug_critical_error();
     abort();
@@ -250,6 +257,7 @@ static void NOINLINE JL_NORETURN start_task(void)
                 jl_sigint_safepoint(ptls);
             }
             JL_TIMING(ROOT);
+            ptls->world_age = jl_world_counter;
             res = jl_apply(&t->start, 1);
         }
         JL_CATCH {
@@ -258,6 +266,7 @@ static void NOINLINE JL_NORETURN start_task(void)
             jl_gc_wb(t, res);
         }
     }
+    jl_get_ptls_states()->world_age = jl_world_counter; // TODO
     finish_task(t, res);
     gc_debug_critical_error();
     abort();
@@ -299,14 +308,16 @@ static void ctx_switch(jl_ptls_t ptls, jl_task_t *t, jl_jmp_buf *where)
     if (!jl_setjmp(ptls->current_task->ctx, 0)) {
         // backtraces don't survive task switches, see e.g. issue #12485
         ptls->bt_size = 0;
-#ifdef COPY_STACKS
         jl_task_t *lastt = ptls->current_task;
+#ifdef COPY_STACKS
         save_stack(ptls, lastt);
 #endif
 
         // set up global state for new task
-        ptls->current_task->gcstack = ptls->pgcstack;
+        lastt->gcstack = ptls->pgcstack;
+        lastt->world_age = ptls->world_age;
         ptls->pgcstack = t->gcstack;
+        ptls->world_age = t->world_age;
 #ifdef JULIA_ENABLE_THREADING
         // If the current task is not holding any locks, free the locks list
         // so that it can be GC'd without leaking memory
@@ -353,7 +364,7 @@ static void ctx_switch(jl_ptls_t ptls, jl_task_t *t, jl_jmp_buf *where)
                 " push %%ebp;\n" // instead of ESP
                 " jmp %P1;\n" // call `start_task` with fake stack frame
                 " ud2"
-                : : "r" (stackbase), ""(&start_task) : "memory" );
+                : : "r" (stackbase), "X"(&start_task) : "memory" );
 #elif defined(_CPU_AARCH64_)
             asm(" mov sp, %0;\n"
                 " mov x29, xzr;\n" // Clear link register (x29) and frame pointer
@@ -394,8 +405,8 @@ JL_DLLEXPORT jl_value_t *jl_switchto(jl_task_t *t, jl_value_t *arg)
     }
     if (ptls->in_finalizer)
         jl_error("task switch not allowed from inside gc finalizer");
-    if (in_pure_callback)
-        jl_error("task switch not allowed from inside staged function");
+    if (ptls->in_pure_callback)
+        jl_error("task switch not allowed from inside staged nor pure functions");
     sig_atomic_t defer_signal = ptls->defer_signal;
     int8_t gc_state = jl_gc_unsafe_enter(ptls);
     ptls->task_arg_in_transit = arg;
@@ -509,6 +520,14 @@ static void init_task(jl_task_t *t, char *stack)
 #endif /* !COPY_STACKS */
 
 jl_timing_block_t *jl_pop_timing_block(jl_timing_block_t *cur_block);
+JL_DLLEXPORT JL_NORETURN void jl_no_exc_handler(jl_value_t *e)
+{
+    jl_printf(JL_STDERR, "fatal: error thrown and no exception handler available.\n");
+    jl_static_show(JL_STDERR, e);
+    jl_printf(JL_STDERR, "\n");
+    jlbacktrace();
+    jl_exit(1);
+}
 
 // yield to exception handler
 void JL_NORETURN throw_internal(jl_value_t *e)
@@ -532,11 +551,7 @@ void JL_NORETURN throw_internal(jl_value_t *e)
         jl_longjmp(eh->eh_ctx, 1);
     }
     else {
-        jl_printf(JL_STDERR, "fatal: error thrown and no exception handler available.\n");
-        jl_static_show(JL_STDERR, e);
-        jl_printf(JL_STDERR, "\n");
-        jlbacktrace();
-        jl_exit(1);
+        jl_no_exc_handler(e);
     }
     assert(0);
 }
@@ -644,32 +659,31 @@ jl_function_t *jl_unprotect_stack_func;
 void jl_init_tasks(void)
 {
     _probe_arch();
-    jl_task_type = jl_new_datatype(jl_symbol("Task"),
-                                   jl_any_type,
-                                   jl_emptysvec,
-                                   jl_svec(13,
-                                           jl_symbol("parent"),
-                                           jl_symbol("storage"),
-                                           jl_symbol("state"),
-                                           jl_symbol("consumers"),
-                                           jl_symbol("donenotify"),
-                                           jl_symbol("result"),
-                                           jl_symbol("exception"),
-                                           jl_symbol("backtrace"),
-                                           jl_symbol("code"),
-                                           jl_symbol("ctx"),
-                                           jl_symbol("bufsz"),
-                                           jl_symbol("stkbuf"),
-                                           jl_symbol("ssize")),
-                                   jl_svec(13,
-                                           jl_any_type,
-                                           jl_any_type, jl_sym_type,
-                                           jl_any_type, jl_any_type,
-                                           jl_any_type, jl_any_type,
-                                           jl_any_type, jl_any_type,
-                                           jl_tupletype_fill(sizeof(jl_jmp_buf), (jl_value_t*)jl_uint8_type),
-                                           jl_long_type, jl_voidpointer_type, jl_long_type),
-                                   0, 1, 8);
+    jl_task_type = (jl_datatype_t*)
+        jl_new_datatype(jl_symbol("Task"),
+                        jl_any_type,
+                        jl_emptysvec,
+                        jl_svec(9,
+                                jl_symbol("parent"),
+                                jl_symbol("storage"),
+                                jl_symbol("state"),
+                                jl_symbol("consumers"),
+                                jl_symbol("donenotify"),
+                                jl_symbol("result"),
+                                jl_symbol("exception"),
+                                jl_symbol("backtrace"),
+                                jl_symbol("code")),
+                        jl_svec(9,
+                                jl_any_type,
+                                jl_any_type,
+                                jl_sym_type,
+                                jl_any_type,
+                                jl_any_type,
+                                jl_any_type,
+                                jl_any_type,
+                                jl_any_type,
+                                jl_any_type),
+                        0, 1, 8);
     jl_svecset(jl_task_type->types, 0, (jl_value_t*)jl_task_type);
 
     done_sym = jl_symbol("done");

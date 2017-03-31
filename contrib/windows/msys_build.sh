@@ -104,6 +104,11 @@ echo "override PCRE_INCL_PATH =" >> Make.user
 # Remove libjulia.dll if it was copied from downloaded binary
 rm -f usr/bin/libjulia.dll
 rm -f usr/bin/libjulia-debug.dll
+rm -f usr/bin/libgcc_s_s*-1.dll
+rm -f usr/bin/libgfortran-3.dll
+rm -f usr/bin/libquadmath-0.dll
+rm -f usr/bin/libssp-0.dll
+rm -f usr/bin/libstdc++-6.dll
 
 if [ -z "$USEMSVC" ]; then
   if [ -z "`which ${CROSS_COMPILE}gcc 2>/dev/null`" -o -n "$APPVEYOR" ]; then
@@ -118,7 +123,7 @@ if [ -z "$USEMSVC" ]; then
   fi
   export AR=${CROSS_COMPILE}ar
 
-  f=llvm-3.7.1-$ARCH-w64-mingw32-juliadeps-r09.7z
+  f=llvm-3.9.1-$ARCH-w64-mingw32-juliadeps-r04.7z
 else
   echo "override USEMSVC = 1" >> Make.user
   echo "override ARCH = $ARCH" >> Make.user
@@ -138,8 +143,6 @@ checksum_download \
     "$f" "https://bintray.com/artifact/download/tkelman/generic/$f"
 echo "Extracting $f"
 $SEVENZIP x -y $f >> get-deps.log
-echo 'override LLVM_CONFIG := $(JULIAHOME)/usr/bin/llvm-config.exe' >> Make.user
-echo 'override LLVM_SIZE := $(JULIAHOME)/usr/bin/llvm-size.exe' >> Make.user
 
 if [ -z "`which make 2>/dev/null`" ]; then
   if [ -n "`uname | grep CYGWIN`" ]; then
@@ -156,9 +159,11 @@ if [ -z "`which make 2>/dev/null`" ]; then
   export PATH=$PWD/bin:$PATH
 fi
 
-f=busybox-w32-FRP-483-g31277ab.exe
-echo "Downloading $f"
-$curlflags -o usr/bin/busybox.exe http://frippery.org/files/busybox/$f
+if ! [ -e usr/bin/busybox.exe ]; then
+  f=busybox-w32-FRP-875-gc6ec14a.exe
+  echo "Downloading $f"
+  $curlflags -o usr/bin/busybox.exe http://frippery.org/files/busybox/$f
+fi
 
 for lib in SUITESPARSE ARPACK BLAS LAPACK FFTW \
     GMP MPFR PCRE LIBUNWIND OPENSPECFUN; do
@@ -171,9 +176,7 @@ echo 'override LIBLAPACKNAME = $(LIBBLASNAME)' >> Make.user
 # libuv since its static lib is no longer included in the binaries
 # openlibm since we need it as a static library to work properly
 # utf8proc since its headers are not in the binary download
-echo 'override STAGE1_DEPS = libuv' >> Make.user
-echo 'override STAGE2_DEPS = utf8proc' >> Make.user
-echo 'override STAGE3_DEPS = ' >> Make.user
+echo 'override DEP_LIBS = libuv utf8proc' >> Make.user
 
 if [ -n "$USEMSVC" ]; then
   # Openlibm doesn't build well with MSVC right now
@@ -185,14 +188,14 @@ if [ -n "$USEMSVC" ]; then
   make -C deps install-libuv install-utf8proc
   cp usr/lib/uv.lib usr/lib/libuv.a
   echo 'override CC += -TP' >> Make.user
-  echo 'override STAGE1_DEPS += dsfmt' >> Make.user
+  echo 'override DEP_LIBS += dsfmt' >> Make.user
 
   # Create a modified version of compile for wrapping link
   sed -e 's/-link//' -e 's/cl/link/g' -e 's/ -Fe/ -OUT:/' \
     -e 's|$dir/$lib|$dir/lib$lib|g' deps/srccache/libuv/compile > linkld
   chmod +x linkld
 else
-  echo 'override STAGE1_DEPS += openlibm' >> Make.user
+  echo 'override DEP_LIBS += openlibm' >> Make.user
   make check-whitespace
   make VERBOSE=1 -C base version_git.jl.phony
   echo 'NO_GIT = 1' >> Make.user

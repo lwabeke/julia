@@ -41,7 +41,7 @@ end
 
 function latexinline(io::IO, code::Code)
     wrapinline(io, "texttt") do
-        print(io, code.code)
+        print(io, latexesc(code.code))
     end
 end
 
@@ -50,12 +50,20 @@ function latex(io::IO, md::Paragraph)
         latexinline(io, md)
     end
     println(io)
+    println(io)
 end
 
 function latex(io::IO, md::BlockQuote)
     wrapblock(io, "quote") do
         latex(io, md.content)
     end
+end
+
+
+function latex(io::IO, f::Footnote)
+    print(io, "\\footnotetext[", f.id, "]{")
+    latex(io, f.text)
+    println(io, "}")
 end
 
 function latex(io::IO, md::Admonition)
@@ -133,6 +141,8 @@ function latexinline(io::IO, md::Image)
         println(io)
     end
 end
+
+latexinline(io::IO, f::Footnote) = print(io, "\\footnotemark[", f.id, "]")
 
 function latexinline(io::IO, md::Link)
     wrapinline(io, "href") do

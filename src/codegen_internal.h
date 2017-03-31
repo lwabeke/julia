@@ -1,6 +1,6 @@
 // This file is a part of Julia. License is MIT: http://julialang.org/license
 
-#if defined(LLVM38) && !defined(LLVM37)
+#if defined(USE_ORCJIT) && JL_LLVM_VERSION <= 30800
 #  include <llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h>
 void notifyObjectLoaded(RTDyldMemoryManager *memmgr,
                         llvm::orc::ObjectLinkingLayerBase::ObjSetHandleT H);
@@ -14,11 +14,12 @@ void jl_dump_asm_internal(uintptr_t Fptr, size_t Fsize, int64_t slide,
 #endif
                           const object::ObjectFile *object,
                           llvm::DIContext *context,
-#ifdef LLVM37
-                          raw_ostream &rstream
+#if JL_LLVM_VERSION >= 30700
+                          raw_ostream &rstream,
 #else
-                          formatted_raw_ostream &stream
+                          formatted_raw_ostream &stream,
 #endif
+                          const char* asm_variant="att"
                           );
 
 // Declarations for debuginfo.cpp
@@ -35,11 +36,6 @@ extern bool jl_dylib_DI_for_fptr(size_t pointer, const object::ObjectFile **obje
         bool onlySysImg, bool *isSysImg, void **saddr, char **name, char **filename);
 
 #ifdef USE_ORCJIT
-JL_DLLEXPORT void ORCNotifyObjectEmitted(JITEventListener *Listener,
-                                         const object::ObjectFile &obj,
-                                         const object::ObjectFile &debugObj,
-                                         const RuntimeDyld::LoadedObjectInfo &L,
-                                         RTDyldMemoryManager *memmgr);
 #ifdef _OS_WINDOWS_
 void *lookupWriteAddressFor(RTDyldMemoryManager *memmgr, void *rt_addr);
 #endif

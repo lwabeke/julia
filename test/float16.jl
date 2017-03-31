@@ -63,10 +63,10 @@ g = Float16(1.)
 @test f^g === Float16(2f0)
 @test f^-g === Float16(0.5f0)
 
-@test f + 2 === Float32(4f0)
-@test f - 2 === Float32(0f0)
-@test f*2 === Float32(4f0)
-@test f/2 === Float32(1f0)
+@test f + 2 === Float16(4f0)
+@test f - 2 === Float16(0f0)
+@test f*2 === Float16(4f0)
+@test f/2 === Float16(1f0)
 @test f + 2. === 4.
 @test f - 2. === 0.
 @test f*2. === 4.
@@ -146,3 +146,6 @@ end
 
 # issue #17148
 @test rem(Float16(1.2), Float16(one(1.2))) == 0.20019531f0
+
+# no domain error is thrown for negative values
+@test cbrt(Float16(-1.0)) == -1.0

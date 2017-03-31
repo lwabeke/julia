@@ -79,9 +79,11 @@ void __cdecl crt_sig_handler(int sig, int num)
         break;
     case SIGINT:
         signal(SIGINT, (void (__cdecl *)(int))crt_sig_handler);
-        if (exit_on_sigint)
-            jl_exit(130); // 128 + SIGINT
-        jl_try_throw_sigint();
+        if (!jl_ignore_sigint()) {
+            if (exit_on_sigint)
+                jl_exit(130); // 128 + SIGINT
+            jl_try_throw_sigint();
+        }
         break;
     default: // SIGSEGV, (SSIGTERM, IGILL)
         memset(&Context, 0, sizeof(Context));
@@ -178,9 +180,11 @@ static BOOL WINAPI sigint_handler(DWORD wsig) //This needs winapi types to guara
         // etc.
         default: sig = SIGTERM; break;
     }
-    if (exit_on_sigint)
-        jl_exit(128 + sig); // 128 + SIGINT
-    jl_try_deliver_sigint();
+    if (!jl_ignore_sigint()) {
+        if (exit_on_sigint)
+            jl_exit(128 + sig); // 128 + SIGINT
+        jl_try_deliver_sigint();
+    }
     return 1;
 }
 
@@ -318,7 +322,6 @@ JL_DLLEXPORT void jl_install_sigint_handler(void)
     SetConsoleCtrlHandler((PHANDLER_ROUTINE)sigint_handler,1);
 }
 
-
 volatile HANDLE hBtThread = 0;
 static DWORD WINAPI profile_bt( LPVOID lparam )
 {
@@ -365,6 +368,7 @@ static DWORD WINAPI profile_bt( LPVOID lparam )
     hBtThread = 0;
     return 0;
 }
+
 JL_DLLEXPORT int jl_profile_start_timer(void)
 {
     running = 1;

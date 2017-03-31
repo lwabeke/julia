@@ -6,12 +6,14 @@
 #include <llvm/ADT/APFloat.h>
 #include <llvm/Support/MathExtras.h>
 
+#include "fix_llvm_assert.h"
+
 #include "APInt-C.h"
 #include "julia.h"
 
 using namespace llvm;
 
-#ifdef LLVM39
+#if JL_LLVM_VERSION >= 30900
 inline uint64_t RoundUpToAlignment(uint64_t Value, uint64_t Align, uint64_t Skew = 0) {
     return alignTo(Value, Align, Skew);
 }
@@ -350,7 +352,11 @@ void LLVMFPtoInt(unsigned numbits, integerPart *pa, unsigned onumbits, integerPa
         APFloat::roundingMode rounding_mode = APFloat::rmNearestTiesToEven;
         unsigned nbytes = RoundUpToAlignment(onumbits, integerPartWidth) / host_char_bit;
         integerPart *parts = (integerPart*)alloca(nbytes);
+#if JL_LLVM_VERSION >= 50000
+        APFloat::opStatus status = a.convertToInteger(MutableArrayRef<integerPart>(parts, nbytes), onumbits, isSigned, rounding_mode, &isVeryExact);
+#else
         APFloat::opStatus status = a.convertToInteger(parts, onumbits, isSigned, rounding_mode, &isVeryExact);
+#endif
         memcpy(pr, parts, onumbytes);
         if (isExact)
             *isExact = (status == APFloat::opOK);
@@ -448,7 +454,7 @@ void LLVMTrunc(unsigned inumbits, integerPart *pa, unsigned onumbits, integerPar
 
 extern "C" JL_DLLEXPORT
 unsigned countTrailingZeros_8(uint8_t Val) {
-#ifdef LLVM35
+#if JL_LLVM_VERSION >= 30500
     return countTrailingZeros(Val);
 #else
     return CountTrailingZeros_32(Val);
@@ -457,7 +463,7 @@ unsigned countTrailingZeros_8(uint8_t Val) {
 
 extern "C" JL_DLLEXPORT
 unsigned countTrailingZeros_16(uint16_t Val) {
-#ifdef LLVM35
+#if JL_LLVM_VERSION >= 30500
     return countTrailingZeros(Val);
 #else
     return CountTrailingZeros_32(Val);
@@ -466,7 +472,7 @@ unsigned countTrailingZeros_16(uint16_t Val) {
 
 extern "C" JL_DLLEXPORT
 unsigned countTrailingZeros_32(uint32_t Val) {
-#ifdef LLVM35
+#if JL_LLVM_VERSION >= 30500
     return countTrailingZeros(Val);
 #else
     return CountTrailingZeros_32(Val);
@@ -475,7 +481,7 @@ unsigned countTrailingZeros_32(uint32_t Val) {
 
 extern "C" JL_DLLEXPORT
 unsigned countTrailingZeros_64(uint64_t Val) {
-#ifdef LLVM35
+#if JL_LLVM_VERSION >= 30500
     return countTrailingZeros(Val);
 #else
     return CountTrailingZeros_64(Val);

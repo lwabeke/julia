@@ -26,7 +26,7 @@ const _htmlescape_chars = Dict('<'=>"&lt;",   '>'=>"&gt;",
                                '"'=>"&quot;", '&'=>"&amp;",
                                # ' '=>"&nbsp;",
                                )
-for ch in "'`!@\$\%()=+{}[]"
+for ch in "'`!\$\%()=+{}[]"
     _htmlescape_chars[ch] = "&#$(Int(ch));"
 end
 
@@ -85,6 +85,15 @@ function html(io::IO, md::BlockQuote)
     withtag(io, :blockquote) do
         println(io)
         html(io, md.content)
+    end
+end
+
+function html(io::IO, f::Footnote)
+    withtag(io, :div, :class => "footnote", :id => "footnote-$(f.id)") do
+        withtag(io, :p, :class => "footnote-title") do
+            print(io, f.id)
+        end
+        html(io, f.text)
     end
 end
 
@@ -148,6 +157,13 @@ end
 
 function htmlinline(io::IO, md::Image)
     tag(io, :img, :src=>md.url, :alt=>md.alt)
+end
+
+
+function htmlinline(io::IO, f::Footnote)
+    withtag(io, :a, :href => "#footnote-$(f.id)", :class => "footnote") do
+        print(io, "[", f.id, "]")
+    end
 end
 
 function htmlinline(io::IO, link::Link)
